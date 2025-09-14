@@ -191,13 +191,35 @@ class OrchestrationDB:
                 )
             """)
 
-            # Create indexes for performance
+            # Create comprehensive indexes for performance optimization
+            # Session-related indexes (for fast dashboard loading)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_start_time_desc ON orchestration_sessions(start_time DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_project_time ON orchestration_sessions(project_name, start_time DESC)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_time ON orchestration_sessions(start_time)")
+
+            # Handoff events indexes (for analytics queries)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_handoffs_timestamp_desc ON handoff_events(timestamp DESC)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_handoffs_session ON handoff_events(session_id)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_handoffs_time ON handoff_events(timestamp)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_handoffs_target_model ON handoff_events(target_model, timestamp DESC)")
+
+            # Subagent invocations indexes (for usage analytics)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_subagents_timestamp_desc ON subagent_invocations(timestamp DESC)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_subagents_session ON subagent_invocations(session_id)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_subagents_type ON subagent_invocations(agent_type)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_subagents_name_time ON subagent_invocations(agent_name, timestamp DESC)")
+
+            # Task outcomes indexes
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_session ON task_outcomes(session_id)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_timestamp ON task_outcomes(timestamp DESC)")
+
+            # Cost metrics indexes (for financial analytics)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cost_period_start ON cost_metrics(period_start DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cost_period_type ON cost_metrics(period_type, period_start DESC)")
+
+            # Pattern analysis indexes
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_timestamp ON pattern_analysis(timestamp DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_type_time ON pattern_analysis(pattern_type, timestamp DESC)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_period ON cost_metrics(period_type, period_start)")
 
     def _init_attribution_systems(self):
