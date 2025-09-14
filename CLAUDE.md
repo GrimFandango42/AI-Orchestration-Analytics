@@ -21,8 +21,14 @@ Production-grade analytics platform for AI orchestration optimization. Tracks Cl
 ### 1. System Launch
 ```bash
 cd AI-Orchestration-Analytics
+
+# Production Launch
 ./scripts/start.bat                    # Windows one-click
 python src/launch.py                   # Manual launch
+
+# Development Mode (with Hot Reload)
+./scripts/start_development.bat        # Development with hot reload
+python src/development/hot_reload.py   # Hot reload system directly
 ```
 
 ### 2. Verification
@@ -75,12 +81,26 @@ pattern_analysis           -- Success pattern identification
 - **Agent Chaining**: Tracks multi-agent workflows
 - **Performance Analysis**: Success rates and execution times per agent
 - **Usage Patterns**: Most used agents and optimal workflows
+- **MCP Tool Integration**: Tracks MCP tool invocations as subagent activities
 
-### 3. Unified Dashboard
+### 3. Intelligent Project Attribution
+- **Context-Aware Detection**: Automatically detects active project from working directory
+- **Multi-Factor Analysis**: File paths, task descriptions, and metadata analysis
+- **44+ Project Support**: Complete inventory of AI_Projects directory
+- **Confidence Scoring**: Weighted attribution with fallback mechanisms
+
+### 4. Unified Dashboard
 - **Real-Time Updates**: Live monitoring with auto-refresh
 - **Interactive Charts**: Handoff distribution, cost trends, agent usage
 - **Drill-Down Analytics**: Session-level and task-level details
+- **Project-Grouped View**: Hierarchical organization by project
 - **Mobile Responsive**: Works on all devices
+
+### 5. Hot Reload Development System
+- **File System Monitoring**: Automatic server restart on code changes
+- **Debounced Updates**: Prevents rapid restart loops
+- **Rate Limiting**: Maximum restart protection
+- **Development Mode**: Seamless CI/CD workflow for rapid iteration
 
 ## Integration Points
 
@@ -297,3 +317,10 @@ python -m pytest tests/test_api.py
 - ✅ Comprehensive analytics with drill-down capabilities
 
 **Next Phase: Production Deployment & Advanced ML**
+
+## 🚀 Recent Enhancements (Latest Session)
+- ✅ **Hot-Reload System**: Seamless CI/CD with automatic server restart
+- ✅ **Intelligent Project Attribution**: Context-aware project detection
+- ✅ **MCP Tool Tracking**: All MCP tools tracked as subagent activities
+- ✅ **Project-Grouped Analytics**: Hierarchical dashboard organization
+- ✅ **Token Attribution**: Project-level Claude vs DeepSeek tracking

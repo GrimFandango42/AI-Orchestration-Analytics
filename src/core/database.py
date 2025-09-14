@@ -4,6 +4,7 @@ Unified database management for AI Orchestration Analytics
 
 import sqlite3
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -16,7 +17,14 @@ class OrchestrationDB:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+
+        # Initialize project attribution and MCP detection systems
+        self._project_attributor = None
+        self._mcp_detector = None
+
         self.init_database()
+        self._upgrade_schema_for_token_attribution()
+        self._init_attribution_systems()
 
     @property
     def conn(self):
@@ -192,10 +200,104 @@ class OrchestrationDB:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_session ON task_outcomes(session_id)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_period ON cost_metrics(period_type, period_start)")
 
+    def _init_attribution_systems(self):
+        """Initialize project attribution and MCP detection systems"""
+        try:
+            # Import here to avoid circular imports
+            from ..tracking.project_attribution import ProjectAttributor
+            from ..tracking.mcp_tool_detector import MCPToolDetector
+
+            self._project_attributor = ProjectAttributor()
+            self._mcp_detector = MCPToolDetector()
+        except ImportError as e:
+            # Log the error but continue without attribution systems
+            print(f"Warning: Could not initialize attribution systems: {e}")
+            self._project_attributor = None
+            self._mcp_detector = None
+
     # Session Management
     def create_session(self, session_id: str, project_name: str = None,
-                      task_description: str = None, metadata: Dict = None) -> int:
-        """Create new orchestration session"""
+                      task_description: str = None, metadata: Dict = None,
+                      working_directory: str = None, file_paths: List[str] = None) -> int:
+        """Create new orchestration session with intelligent project attribution"""
+
+        # Use intelligent project attribution if no project name provided
+        if not project_name and self._project_attributor:
+            try:
+                # Use current working directory if not provided
+                if not working_directory:
+                    working_directory = os.getcwd()
+
+                # Detect project from context
+                detected_project, confidence = self._project_attributor.detect_project_from_context(
+                    working_directory=working_directory,
+                    file_paths=file_paths,
+                    task_description=task_description,
+                    metadata=metadata
+                )
+
+                # Use detected project if confidence is high enough
+                if confidence > 0.5:
+                    project_name = detected_project
+
+                    # Add attribution info to metadata
+                    if not metadata:
+                        metadata = {}
+                    metadata.update({
+                        'attribution': {
+                            'detected_project': detected_project,
+                            'confidence': confidence,
+                            'working_directory': working_directory,
+                            'detection_method': 'intelligent_attribution'
+                        }
+                    })
+
+            except Exception as e:
+                # Log error but continue with fallback
+                print(f"Warning: Project attribution failed: {e}")
+                if not project_name:
+                    project_name = 'other'
+
+        # Fallback if no project detected
+        if not project_name:
+            project_name = 'other'
+
+        # Check for MCP tool invocations
+        if self._mcp_detector and task_description:
+            try:
+                mcp_invocation = self._mcp_detector.detect_mcp_invocation(
+                    task_description=task_description,
+                    metadata=metadata,
+                    file_paths=file_paths
+                )
+
+                if mcp_invocation:
+                    # Track MCP tool invocation as subagent activity
+                    self.track_mcp_tool_invocation(
+                        session_id=session_id,
+                        tool_name=mcp_invocation.tool_name,
+                        server_name=mcp_invocation.server_name,
+                        tool_category=mcp_invocation.tool_type,
+                        task_description=mcp_invocation.invocation_context,
+                        estimated_tokens=mcp_invocation.estimated_tokens,
+                        project_context=mcp_invocation.project_context
+                    )
+
+                    # Add MCP info to metadata
+                    if not metadata:
+                        metadata = {}
+                    metadata.update({
+                        'mcp_tool': {
+                            'tool_name': mcp_invocation.tool_name,
+                            'server_name': mcp_invocation.server_name,
+                            'confidence': mcp_invocation.confidence,
+                            'estimated_tokens': mcp_invocation.estimated_tokens
+                        }
+                    })
+
+            except Exception as e:
+                print(f"Warning: MCP tool detection failed: {e}")
+
         with self.conn:
             cursor = self.conn.execute("""
                 INSERT INTO orchestration_sessions
@@ -584,6 +686,307 @@ class OrchestrationDB:
                 'previous_offset': max(0, offset - limit) if has_previous else None
             }
         }
+
+    def get_project_grouped_activity(self, limit: int = 10, offset: int = 0) -> Dict:
+        """Get activity grouped by project with expandable details
+
+        Args:
+            limit: Number of projects to return (default 10)
+            offset: Number of projects to skip (default 0)
+
+        Returns:
+            Dict with project groups, each containing session info and sub-activities
+        """
+        # Get projects with session counts, date ranges, and statistics
+        projects_cursor = self.conn.execute("""
+            SELECT
+                project_name,
+                COUNT(*) as session_count,
+                MIN(start_time) as earliest_session,
+                MAX(start_time) as latest_session,
+                COUNT(DISTINCT DATE(start_time)) as active_days,
+                SUM(completed_tasks) as total_completed_tasks,
+                SUM(failed_tasks) as total_failed_tasks
+            FROM orchestration_sessions
+            GROUP BY project_name
+            ORDER BY latest_session DESC, session_count DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+
+        projects = []
+        for project_row in projects_cursor.fetchall():
+            project_data = dict(project_row)
+            project_name = project_data['project_name']
+
+            # Get recent handoffs for this project
+            handoffs_cursor = self.conn.execute("""
+                SELECT
+                    h.timestamp, h.session_id, h.task_description, h.target_model,
+                    h.cost, h.confidence_score,
+                    CASE WHEN h.success = 1 THEN 'success' ELSE 'failed' END as status
+                FROM handoff_events h
+                JOIN orchestration_sessions s ON h.session_id = s.session_id
+                WHERE s.project_name = ?
+                ORDER BY h.timestamp DESC
+                LIMIT 20
+            """, (project_name,))
+
+            handoffs = [dict(row) for row in handoffs_cursor.fetchall()]
+
+            # Get recent subagent invocations for this project
+            subagents_cursor = self.conn.execute("""
+                SELECT
+                    sa.timestamp, sa.session_id, sa.agent_name, sa.task_description,
+                    sa.cost, sa.execution_time,
+                    CASE WHEN sa.success = 1 THEN 'success' ELSE 'failed' END as status
+                FROM subagent_invocations sa
+                JOIN orchestration_sessions s ON sa.session_id = s.session_id
+                WHERE s.project_name = ?
+                ORDER BY sa.timestamp DESC
+                LIMIT 20
+            """, (project_name,))
+
+            subagents = [dict(row) for row in subagents_cursor.fetchall()]
+
+            # Calculate project-level statistics
+            total_cost = 0.0
+            for handoff in handoffs:
+                cost = handoff.get('cost', 0)
+                if cost is not None:
+                    total_cost += float(cost)
+            for subagent in subagents:
+                cost = subagent.get('cost', 0)
+                if cost is not None:
+                    total_cost += float(cost)
+
+            success_rate = 0.0
+            total_tasks = project_data['total_completed_tasks'] + project_data['total_failed_tasks']
+            if total_tasks > 0:
+                success_rate = (project_data['total_completed_tasks'] / total_tasks) * 100
+
+            project_data.update({
+                'handoffs': handoffs,
+                'subagents': subagents,
+                'total_handoffs': len(handoffs),
+                'total_subagents': len(subagents),
+                'total_cost': round(total_cost, 4),
+                'success_rate': round(success_rate, 1)
+            })
+
+            projects.append(project_data)
+
+        # Get total project count for pagination
+        total_projects_cursor = self.conn.execute("""
+            SELECT COUNT(DISTINCT project_name) FROM orchestration_sessions
+        """)
+        total_projects = total_projects_cursor.fetchone()[0]
+
+        # Calculate pagination info
+        total_pages = (total_projects + limit - 1) // limit
+        current_page = (offset // limit) + 1
+        has_next = offset + limit < total_projects
+        has_previous = offset > 0
+
+        return {
+            'projects': projects,
+            'pagination': {
+                'total_count': total_projects,
+                'total_pages': total_pages,
+                'current_page': current_page,
+                'page_size': limit,
+                'has_next': has_next,
+                'has_previous': has_previous,
+                'next_offset': offset + limit if has_next else None,
+                'previous_offset': max(0, offset - limit) if has_previous else None
+            }
+        }
+
+    def _upgrade_schema_for_token_attribution(self):
+        """Upgrade database schema to support token attribution tracking"""
+        try:
+            # Check if token attribution columns exist
+            cursor = self.conn.execute("PRAGMA table_info(orchestration_sessions)")
+            columns = [row[1] for row in cursor.fetchall()]
+
+            # Add token attribution columns if they don't exist
+            if 'claude_tokens_used' not in columns:
+                self.conn.execute("ALTER TABLE orchestration_sessions ADD COLUMN claude_tokens_used INTEGER DEFAULT 0")
+            if 'deepseek_tokens_used' not in columns:
+                self.conn.execute("ALTER TABLE orchestration_sessions ADD COLUMN deepseek_tokens_used INTEGER DEFAULT 0")
+            if 'mcp_tool_invocations' not in columns:
+                self.conn.execute("ALTER TABLE orchestration_sessions ADD COLUMN mcp_tool_invocations INTEGER DEFAULT 0")
+
+            # Add token attribution to handoff_events
+            cursor = self.conn.execute("PRAGMA table_info(handoff_events)")
+            columns = [row[1] for row in cursor.fetchall()]
+
+            if 'claude_tokens_used' not in columns:
+                self.conn.execute("ALTER TABLE handoff_events ADD COLUMN claude_tokens_used INTEGER DEFAULT 0")
+            if 'deepseek_tokens_used' not in columns:
+                self.conn.execute("ALTER TABLE handoff_events ADD COLUMN deepseek_tokens_used INTEGER DEFAULT 0")
+            if 'token_source' not in columns:
+                self.conn.execute("ALTER TABLE handoff_events ADD COLUMN token_source TEXT DEFAULT 'claude'")
+
+            # Add MCP tool tracking to subagent_invocations
+            cursor = self.conn.execute("PRAGMA table_info(subagent_invocations)")
+            columns = [row[1] for row in cursor.fetchall()]
+
+            if 'mcp_tool_name' not in columns:
+                self.conn.execute("ALTER TABLE subagent_invocations ADD COLUMN mcp_tool_name TEXT")
+            if 'mcp_server_name' not in columns:
+                self.conn.execute("ALTER TABLE subagent_invocations ADD COLUMN mcp_server_name TEXT")
+            if 'tool_category' not in columns:
+                self.conn.execute("ALTER TABLE subagent_invocations ADD COLUMN tool_category TEXT")
+            if 'estimated_tokens' not in columns:
+                self.conn.execute("ALTER TABLE subagent_invocations ADD COLUMN estimated_tokens INTEGER DEFAULT 0")
+
+            self.conn.commit()
+
+        except Exception as e:
+            logger.warning(f"Schema upgrade warning: {e}")
+
+    def track_mcp_tool_invocation(self,
+                                 session_id: str,
+                                 tool_name: str,
+                                 server_name: str,
+                                 tool_category: str,
+                                 task_description: str,
+                                 estimated_tokens: int = 0,
+                                 execution_time: float = None,
+                                 success: bool = True,
+                                 project_context: str = None) -> int:
+        """Track MCP tool invocation as a subagent activity"""
+
+        return self.track_subagent(
+            session_id=session_id,
+            agent_type='mcp_tool',
+            agent_name=f"{server_name}.{tool_name}",
+            trigger_phrase=f"MCP tool invocation: {tool_name}",
+            task_description=task_description,
+            execution_time=execution_time,
+            success=success,
+            tokens_used=estimated_tokens,
+            metadata={
+                'mcp_tool_name': tool_name,
+                'mcp_server_name': server_name,
+                'tool_category': tool_category,
+                'project_context': project_context,
+                'estimated_tokens': estimated_tokens,
+                'invocation_type': 'mcp_tool'
+            }
+        )
+
+    def get_project_token_attribution(self, project_name: str = None) -> Dict[str, Any]:
+        """Get detailed token attribution analysis for projects"""
+
+        if project_name:
+            # Single project analysis
+            where_clause = "WHERE s.project_name = ?"
+            params = [project_name]
+        else:
+            # All projects
+            where_clause = ""
+            params = []
+
+        # Get session-level token data
+        session_tokens = self.conn.execute(f"""
+            SELECT
+                s.project_name,
+                SUM(s.claude_tokens_used) as session_claude_tokens,
+                SUM(s.deepseek_tokens_used) as session_deepseek_tokens,
+                SUM(s.mcp_tool_invocations) as total_mcp_invocations,
+                COUNT(*) as total_sessions
+            FROM orchestration_sessions s
+            {where_clause}
+            GROUP BY s.project_name
+        """, params).fetchall()
+
+        # Get handoff-level token data
+        handoff_tokens = self.conn.execute(f"""
+            SELECT
+                s.project_name,
+                SUM(h.claude_tokens_used) as handoff_claude_tokens,
+                SUM(h.deepseek_tokens_used) as handoff_deepseek_tokens,
+                SUM(CASE WHEN h.target_model = 'deepseek' THEN 1 ELSE 0 END) as deepseek_handoffs,
+                SUM(CASE WHEN h.target_model = 'claude' THEN 1 ELSE 0 END) as claude_handoffs,
+                COUNT(*) as total_handoffs
+            FROM handoff_events h
+            JOIN orchestration_sessions s ON h.session_id = s.session_id
+            {where_clause}
+            GROUP BY s.project_name
+        """, params).fetchall()
+
+        # Get MCP tool usage data
+        mcp_usage = self.conn.execute(f"""
+            SELECT
+                s.project_name,
+                sa.mcp_server_name,
+                sa.tool_category,
+                COUNT(*) as invocation_count,
+                SUM(sa.estimated_tokens) as total_mcp_tokens,
+                AVG(sa.execution_time) as avg_execution_time
+            FROM subagent_invocations sa
+            JOIN orchestration_sessions s ON sa.session_id = s.session_id
+            WHERE sa.agent_type = 'mcp_tool' {' AND ' + where_clause.replace('WHERE ', '') if where_clause else ''}
+            GROUP BY s.project_name, sa.mcp_server_name, sa.tool_category
+        """, params).fetchall()
+
+        # Combine and structure the data
+        result = {}
+
+        for row in session_tokens:
+            project = dict(row)
+            project_name = project['project_name']
+            result[project_name] = {
+                'session_data': project,
+                'handoff_data': {},
+                'mcp_usage': {},
+                'token_breakdown': {
+                    'claude_total': project['session_claude_tokens'] or 0,
+                    'deepseek_total': project['session_deepseek_tokens'] or 0,
+                    'mcp_tool_tokens': 0
+                }
+            }
+
+        # Add handoff data
+        for row in handoff_tokens:
+            handoff = dict(row)
+            project_name = handoff['project_name']
+            if project_name in result:
+                result[project_name]['handoff_data'] = handoff
+                # Add handoff tokens to totals
+                result[project_name]['token_breakdown']['claude_total'] += handoff['handoff_claude_tokens'] or 0
+                result[project_name]['token_breakdown']['deepseek_total'] += handoff['handoff_deepseek_tokens'] or 0
+
+        # Add MCP usage data
+        for row in mcp_usage:
+            mcp = dict(row)
+            project_name = mcp['project_name']
+            if project_name in result:
+                server_name = mcp['mcp_server_name'] or 'unknown'
+                if server_name not in result[project_name]['mcp_usage']:
+                    result[project_name]['mcp_usage'][server_name] = []
+
+                result[project_name]['mcp_usage'][server_name].append(mcp)
+                result[project_name]['token_breakdown']['mcp_tool_tokens'] += mcp['total_mcp_tokens'] or 0
+
+        # Calculate percentages and insights
+        for project_name, data in result.items():
+            token_breakdown = data['token_breakdown']
+            total_tokens = token_breakdown['claude_total'] + token_breakdown['deepseek_total'] + token_breakdown['mcp_tool_tokens']
+
+            if total_tokens > 0:
+                token_breakdown['claude_percentage'] = round((token_breakdown['claude_total'] / total_tokens) * 100, 1)
+                token_breakdown['deepseek_percentage'] = round((token_breakdown['deepseek_total'] / total_tokens) * 100, 1)
+                token_breakdown['mcp_percentage'] = round((token_breakdown['mcp_tool_tokens'] / total_tokens) * 100, 1)
+            else:
+                token_breakdown['claude_percentage'] = 0
+                token_breakdown['deepseek_percentage'] = 0
+                token_breakdown['mcp_percentage'] = 0
+
+            token_breakdown['total_tokens'] = total_tokens
+
+        return result
 
     def close(self):
         """Close database connection"""
