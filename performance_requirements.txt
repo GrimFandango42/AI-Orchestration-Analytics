@@ -1,0 +1,15 @@
+# Performance Testing Dependencies
+locust>=2.17.0          # Load testing framework
+pytest>=7.4.0           # Testing framework
+pytest-asyncio>=0.21.0  # Async testing support
+aiohttp>=3.8.0          # Async HTTP client
+psutil>=5.9.0           # System resource monitoring
+memory-profiler>=0.61.0 # Memory profiling
+line-profiler>=4.1.0    # Line-by-line profiling
+py-spy>=0.3.14          # Sampling profiler
+matplotlib>=3.7.0       # Plotting for performance graphs
+pandas>=2.0.0           # Data analysis
+numpy>=1.24.0           # Numerical operations
+seaborn>=0.12.0         # Statistical visualizations
+asyncpg>=0.28.0         # Async PostgreSQL (for comparison tests)
+websockets>=11.0.3      # WebSocket client testing
