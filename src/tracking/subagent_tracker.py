@@ -346,7 +346,7 @@ class SubagentTracker:
 
         # Performance recommendations
         slow_agents = [stat for stat in usage_stats
-                      if stat.get('avg_execution_time', 0) > 30.0]
+                      if (stat.get('avg_execution_time') or 0) > 30.0]
         if slow_agents:
             recommendations.append("Some agents have slow execution times. Review task complexity and optimize.")
 
@@ -375,7 +375,7 @@ class SubagentTracker:
                 health[agent_name] = 'unused'
             elif agent_stats.get('success_rate', 0) < 80:
                 health[agent_name] = 'poor'
-            elif agent_stats.get('avg_execution_time', 0) > 60:
+            elif (agent_stats.get('avg_execution_time') or 0) > 60:
                 health[agent_name] = 'slow'
             elif agent_stats.get('invocation_count', 0) < 5:
                 health[agent_name] = 'underutilized'

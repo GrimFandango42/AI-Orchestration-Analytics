@@ -9,8 +9,11 @@ from quart_cors import cors
 import sqlite3
 import json
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
+
+logger = logging.getLogger(__name__)
 
 from src.core.database import OrchestrationDB
 from src.tracking.handoff_monitor import HandoffMonitor, DeepSeekClient
@@ -319,6 +322,17 @@ async def dashboard():
                 </div>
             </div>
 
+            <!-- Max-to-Pro Account Transition Analysis -->
+            <div class="card">
+                <h3 class="card-title">Max → Pro Account Transition</h3>
+                <div id="accountTransitionMetrics">
+                    <!-- Metrics will be loaded here -->
+                </div>
+                <div class="chart-container">
+                    <canvas id="transitionChart"></canvas>
+                </div>
+            </div>
+
             <!-- Performance Metrics -->
             <div class="card">
                 <h3 class="card-title">Performance Metrics</h3>
@@ -349,6 +363,18 @@ async def dashboard():
                     </tbody>
                 </table>
             </div>
+
+            <!-- Pagination Controls -->
+            <div class="pagination-container" style="display: flex; justify-content: space-between; align-items: center; margin-top: 15px; padding: 0 10px;">
+                <div class="pagination-info">
+                    <span id="paginationInfo">Loading...</span>
+                </div>
+                <div class="pagination-controls">
+                    <button id="prevBtn" class="btn" style="margin-right: 10px;" onclick="loadActivityPage('prev')" disabled>← Previous</button>
+                    <span id="pageInfo">Page 1</span>
+                    <button id="nextBtn" class="btn" style="margin-left: 10px;" onclick="loadActivityPage('next')" disabled>Next →</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -356,6 +382,8 @@ async def dashboard():
         let charts = {};
         let autoRefreshInterval = null;
         let isAutoRefresh = false;
+        let currentActivityPage = 1;
+        let activityPagination = null;
 
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
@@ -369,6 +397,7 @@ async def dashboard():
                     loadHandoffAnalytics(),
                     loadSubagentAnalytics(),
                     loadCostAnalytics(),
+                    loadAccountTransitionAnalysis(),
                     loadPerformanceMetrics(),
                     loadRecentActivity()
                 ]);
@@ -521,22 +550,159 @@ async def dashboard():
             `;
         }
 
-        async function loadRecentActivity() {
-            const response = await fetch('/api/recent-activity');
-            const data = await response.json();
+        async function loadAccountTransitionAnalysis() {
+            try {
+                const response = await fetch('/api/account-transition-analysis');
+                const data = await response.json();
 
-            const tbody = document.getElementById('activityBody');
-            tbody.innerHTML = data.activities.map(activity => `
-                <tr>
-                    <td>${new Date(activity.timestamp).toLocaleTimeString()}</td>
-                    <td>${activity.session_id?.substring(0, 8) || 'N/A'}</td>
-                    <td>${activity.event_type}</td>
-                    <td class="model-${activity.model_or_agent?.toLowerCase() || ''}">${activity.model_or_agent || 'Unknown'}</td>
-                    <td>${activity.description?.substring(0, 50) || ''}${activity.description?.length > 50 ? '...' : ''}</td>
-                    <td class="${activity.status}">${activity.status}</td>
-                    <td>$${(activity.cost || 0).toFixed(3)}</td>
-                </tr>
-            `).join('');
+                if (data.transition_projection) {
+                    const projection = data.transition_projection;
+                    const metrics = document.getElementById('accountTransitionMetrics');
+
+                    // Status color based on readiness
+                    const readinessColor = projection.transition_readiness === 'ready' ? '#10B981' :
+                                         projection.transition_readiness === 'approaching' ? '#F59E0B' : '#EF4444';
+
+                    metrics.innerHTML = `
+                        <div class="metric">
+                            <span class="metric-label">Transition Status</span>
+                            <span class="metric-value" style="color: ${readinessColor}">
+                                ${projection.transition_readiness.toUpperCase()}
+                            </span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">DeepSeek Utilization</span>
+                            <span class="metric-value">${(projection.deepseek_utilization_ratio * 100).toFixed(1)}%</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Effectiveness Score</span>
+                            <span class="metric-value success">${(projection.effectiveness_score * 100).toFixed(1)}%</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Potential Monthly Savings</span>
+                            <span class="metric-value success">$${projection.potential_monthly_savings.toFixed(0)}</span>
+                        </div>
+                        <div class="recommendation-box" style="margin-top: 15px; padding: 12px; background: rgba(16, 185, 129, 0.1); border-left: 4px solid #10B981; border-radius: 4px;">
+                            <strong>Recommendation:</strong><br>
+                            <span style="font-size: 13px;">${projection.recommendation}</span>
+                        </div>
+                    `;
+
+                    // Create transition projection chart
+                    updateTransitionChart(projection);
+                }
+            } catch (error) {
+                console.error('Error loading account transition analysis:', error);
+                const metrics = document.getElementById('accountTransitionMetrics');
+                metrics.innerHTML = '<div class="error">Error loading transition analysis</div>';
+            }
+        }
+
+        function updateTransitionChart(projection) {
+            const ctx = document.getElementById('transitionChart').getContext('2d');
+
+            new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['DeepSeek Usage', 'Claude Usage'],
+                    datasets: [{
+                        data: [
+                            projection.deepseek_utilization_ratio * 100,
+                            (1 - projection.deepseek_utilization_ratio) * 100
+                        ],
+                        backgroundColor: ['#10B981', '#667eea'],
+                        borderWidth: 2,
+                        borderColor: '#ffffff'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Current Usage Distribution',
+                            font: { size: 14, weight: 'bold' }
+                        },
+                        legend: {
+                            position: 'bottom',
+                            labels: { padding: 20, usePointStyle: true }
+                        }
+                    }
+                }
+            });
+        }
+
+        async function loadRecentActivity(page = 1) {
+            try {
+                const response = await fetch(`/api/recent-activity?page=${page}&limit=50`);
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    currentActivityPage = page;
+                    activityPagination = data.pagination;
+
+                    const tbody = document.getElementById('activityBody');
+                    tbody.innerHTML = data.activities.map(activity => `
+                        <tr>
+                            <td>${new Date(activity.timestamp).toLocaleTimeString()}</td>
+                            <td>${activity.session_id?.substring(0, 8) || 'N/A'}</td>
+                            <td>${activity.event_type}</td>
+                            <td class="model-${activity.model_or_agent?.toLowerCase() || ''}">${activity.model_or_agent || 'Unknown'}</td>
+                            <td>${activity.description?.substring(0, 50) || ''}${activity.description?.length > 50 ? '...' : ''}</td>
+                            <td class="${activity.status}">${activity.status}</td>
+                            <td>$${(activity.cost || 0).toFixed(3)}</td>
+                        </tr>
+                    `).join('');
+
+                    // Update pagination info
+                    updateActivityPagination();
+                } else {
+                    console.error('Error loading recent activity:', data.error);
+                    const tbody = document.getElementById('activityBody');
+                    tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #ff6b6b;">Error loading activity data</td></tr>';
+                }
+            } catch (error) {
+                console.error('Error fetching recent activity:', error);
+                const tbody = document.getElementById('activityBody');
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #ff6b6b;">Error loading activity data</td></tr>';
+            }
+        }
+
+        function updateActivityPagination() {
+            if (!activityPagination) return;
+
+            const paginationInfo = document.getElementById('paginationInfo');
+            const pageInfo = document.getElementById('pageInfo');
+            const prevBtn = document.getElementById('prevBtn');
+            const nextBtn = document.getElementById('nextBtn');
+
+            // Update info text
+            const start = ((currentActivityPage - 1) * 50) + 1;
+            const end = Math.min(currentActivityPage * 50, activityPagination.total_count);
+            paginationInfo.textContent = `Showing ${start}-${end} of ${activityPagination.total_count} activities`;
+
+            // Update page info
+            pageInfo.textContent = `Page ${currentActivityPage} of ${activityPagination.total_pages}`;
+
+            // Update button states
+            prevBtn.disabled = !activityPagination.has_previous;
+            nextBtn.disabled = !activityPagination.has_next;
+        }
+
+        function loadActivityPage(direction) {
+            if (!activityPagination) return;
+
+            let newPage = currentActivityPage;
+            if (direction === 'next' && activityPagination.has_next) {
+                newPage = currentActivityPage + 1;
+            } else if (direction === 'prev' && activityPagination.has_previous) {
+                newPage = currentActivityPage - 1;
+            }
+
+            if (newPage !== currentActivityPage) {
+                loadRecentActivity(newPage);
+            }
         }
 
         function updateHandoffChart(data) {
@@ -739,30 +905,44 @@ async def performance_metrics():
 
 @app.route("/api/recent-activity")
 async def recent_activity():
-    """Get recent orchestration activity"""
-    # Mock data for now - would be replaced with real database queries
-    activities = [
-        {
-            'timestamp': datetime.now().isoformat(),
-            'session_id': 'sess_12345',
-            'event_type': 'handoff',
-            'model_or_agent': 'deepseek',
-            'description': 'Code implementation task routed to DeepSeek',
-            'status': 'success',
-            'cost': 0.0
-        },
-        {
-            'timestamp': (datetime.now() - timedelta(minutes=5)).isoformat(),
-            'session_id': 'sess_12344',
-            'event_type': 'subagent',
-            'model_or_agent': 'api-testing-specialist',
-            'description': 'API testing specialist invoked',
-            'status': 'success',
-            'cost': 0.025
-        }
-    ]
+    """Get recent orchestration activity with pagination"""
+    try:
+        # Get pagination parameters
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 50))
+        offset = (page - 1) * limit
 
-    return jsonify({'activities': activities})
+        # Get paginated activity data from database
+        activity_data = db.get_recent_activity(limit=limit, offset=offset)
+
+        return jsonify({
+            'activities': activity_data['activities'],
+            'pagination': activity_data['pagination'],
+            'status': 'success'
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching recent activity: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route("/api/account-transition-analysis")
+async def account_transition_analysis():
+    """Get Max-to-Pro account transition analysis"""
+    try:
+        # Get transition projection
+        projection = db.get_account_transition_projection()
+
+        # Get recent account analysis data
+        recent_analysis = db.get_claude_account_analysis(period_type='daily', limit=30)
+
+        return jsonify({
+            'transition_projection': projection,
+            'historical_analysis': recent_analysis,
+            'status': 'success'
+        })
+    except Exception as e:
+        logger.error(f"Error getting account transition analysis: {e}")
+        return jsonify({'error': str(e)}), 500
 
 # Track new session endpoint
 @app.route("/api/track/session", methods=['POST'])
