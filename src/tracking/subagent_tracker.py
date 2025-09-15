@@ -240,12 +240,27 @@ class SubagentTracker:
 
         start_time = execution_start or time.time()
 
+        # Handle both dict and SubagentInvocation object formats
+        if isinstance(invocation, dict):
+            # Convert dict to SubagentInvocation object
+            invocation_obj = SubagentInvocation(
+                agent_type=invocation.get('agent_type', 'specialized'),
+                agent_name=invocation.get('agent_name', 'unknown'),
+                trigger_phrase=invocation.get('trigger_phrase', ''),
+                task_description=invocation.get('task_description', ''),
+                parent_agent=invocation.get('parent_agent'),
+                confidence=invocation.get('confidence', 0.8),
+                estimated_complexity=invocation.get('estimated_complexity', 'medium')
+            )
+        else:
+            invocation_obj = invocation
+
         return self.db.track_subagent(
             session_id=session_id,
-            agent_type=invocation.agent_type,
-            agent_name=invocation.agent_name,
-            trigger_phrase=invocation.trigger_phrase,
-            task_description=invocation.task_description,
+            agent_type=invocation_obj.agent_type,
+            agent_name=invocation_obj.agent_name,
+            trigger_phrase=invocation_obj.trigger_phrase,
+            task_description=invocation_obj.task_description,
             parent_agent=parent_agent,
             execution_time=None,  # Will be updated when complete
             success=None,  # Will be updated when complete
@@ -253,9 +268,9 @@ class SubagentTracker:
             tokens_used=None,
             cost=None,
             metadata={
-                'confidence': invocation.confidence,
-                'estimated_complexity': invocation.estimated_complexity,
-                'detection_method': self._get_detection_method(invocation),
+                'confidence': invocation_obj.confidence,
+                'estimated_complexity': invocation_obj.estimated_complexity,
+                'detection_method': self._get_detection_method(invocation_obj),
                 'available_agents': list(self.available_agents.keys())
             }
         )

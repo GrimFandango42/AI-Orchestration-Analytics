@@ -4,20 +4,20 @@ AI Orchestration Analytics Dashboard
 Unified dashboard for tracking AI orchestration, handoffs, and subagent usage
 """
 
-from quart import Quart, jsonify, render_template_string, request
+from quart import Quart, jsonify, render_template_string, request, Response
 from quart_cors import cors
 import sqlite3
 import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Any
+from typing import Dict, List, Any, AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
 from src.core.database import OrchestrationDB
 from src.tracking.handoff_monitor import HandoffMonitor, DeepSeekClient
-from src.tracking.subagent_tracker import SubagentTracker
+from src.tracking.subagent_tracker import SubagentTracker, SubagentInvocation
 
 app = Quart(__name__)
 app = cors(app, allow_origin="*")
@@ -111,6 +111,51 @@ async def dashboard():
         .status-online { color: #22c55e; }
         .status-offline { color: #ef4444; }
         .status-warning { color: #f59e0b; }
+
+        /* Enhanced Status Indicators */
+        .status-item {
+            position: relative;
+            padding: 10px 15px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            transition: all 0.3s ease;
+        }
+
+        .status-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateY(-2px);
+        }
+
+        .status-value {
+            position: relative;
+        }
+
+        .status-value:before {
+            content: '';
+            position: absolute;
+            left: -20px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .status-value.status-online:before {
+            background: #22c55e;
+            box-shadow: 0 0 10px rgba(34, 197, 94, 0.5);
+        }
+
+        .status-value.status-offline:before {
+            background: #ef4444;
+            box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
+        }
+
+        .status-value.status-warning:before {
+            background: #f59e0b;
+            box-shadow: 0 0 10px rgba(245, 158, 11, 0.5);
+        }
 
         /* Tooltip Styles */
         .tooltip {
@@ -514,6 +559,31 @@ async def dashboard():
             50% { opacity: 0.5; }
             100% { opacity: 1; }
         }
+
+        /* Data Quality Indicators */
+        .historical-data {
+            background-color: #f8f9fa;
+            opacity: 0.8;
+            border-left: 3px solid #6c757d;
+        }
+
+        .old-data {
+            background-color: #fff3cd;
+            border-left: 3px solid #ffc107;
+        }
+
+        .recent-data {
+            background-color: #d1edff;
+            border-left: 3px solid #28a745;
+        }
+
+        .historical-data:hover,
+        .old-data:hover,
+        .recent-data:hover {
+            opacity: 1;
+            transform: scale(1.01);
+            transition: all 0.2s ease;
+        }
     </style>
 </head>
 <body>
@@ -603,13 +673,14 @@ async def dashboard():
                 <table id="activityTable">
                     <thead>
                         <tr>
-                            <th>Time</th>
+                            <th>Date & Time</th>
                             <th>Session</th>
                             <th>Event Type</th>
                             <th>Model/Agent</th>
                             <th>Description</th>
                             <th>Status</th>
                             <th>Cost</th>
+                            <th>Project</th>
                         </tr>
                     </thead>
                     <tbody id="activityBody">
@@ -635,18 +706,199 @@ async def dashboard():
     <script>
         let charts = {};
         let autoRefreshInterval = null;
-        let isAutoRefresh = false;
+        let isAutoRefresh = true; // Default to enabled
         let currentActivityPage = 1;
         let activityPagination = null;
         let isProjectView = true;
         let currentProjectPage = 1;
         let projectPagination = null;
 
+        // SSE Real-time Updates
+        let eventSource = null;
+        let sseReconnectInterval = null;
+
+        // Initialize SSE connection for real-time updates
+        function initializeSSE() {
+            console.log('Initializing SSE connection...');
+
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            try {
+                eventSource = new EventSource('/api/events');
+
+                eventSource.onopen = function(event) {
+                    console.log('SSE connection opened');
+                    clearInterval(sseReconnectInterval);
+                    // Stop the old polling system
+                    if (autoRefreshInterval) {
+                        clearInterval(autoRefreshInterval);
+                        autoRefreshInterval = null;
+                        console.log('Stopped old polling system in favor of SSE');
+                    }
+                };
+
+                eventSource.onmessage = function(event) {
+                    console.log('SSE message received:', event.data);
+                    try {
+                        const data = JSON.parse(event.data);
+
+                        if (data.type === 'dashboard_update') {
+                            // Update system status
+                            if (data.system_status) {
+                                updateSystemStatusFromSSE(data.system_status);
+                            }
+
+                            // Update recent activity
+                            if (data.recent_activity) {
+                                updateActivityTableFromSSE(data.recent_activity);
+                            }
+
+                            // Show last update time in live indicator
+                            const liveIndicator = document.getElementById('liveIndicator');
+                            if (liveIndicator) {
+                                liveIndicator.textContent = `Live • ${new Date().toLocaleTimeString()}`;
+                                liveIndicator.style.display = 'inline-block';
+                            }
+
+                        } else if (data.type === 'error') {
+                            console.error('SSE error event:', data.message);
+                            showSSEError(data.message);
+                        }
+                    } catch (error) {
+                        console.error('Error parsing SSE data:', error);
+                    }
+                };
+
+                eventSource.onerror = function(event) {
+                    console.error('SSE connection error:', event);
+                    eventSource.close();
+                    showSSEError('Connection lost - attempting to reconnect...');
+
+                    // Attempt to reconnect after 5 seconds
+                    sseReconnectInterval = setTimeout(() => {
+                        console.log('Attempting SSE reconnection...');
+                        initializeSSE();
+                    }, 5000);
+                };
+
+            } catch (error) {
+                console.error('Failed to initialize SSE:', error);
+                showSSEError('Real-time updates unavailable - falling back to manual refresh');
+                // Fallback to manual refresh if SSE fails
+                setupFallbackPolling();
+            }
+        }
+
+        // Update system status from SSE data
+        function updateSystemStatusFromSSE(statusData) {
+            try {
+                // Update session count
+                const sessionElement = document.getElementById('today-sessions');
+                if (sessionElement && statusData.today_sessions !== undefined) {
+                    sessionElement.textContent = statusData.today_sessions;
+                }
+
+                // Update active projects
+                const projectsElement = document.getElementById('active-projects');
+                if (projectsElement && statusData.active_projects !== undefined) {
+                    projectsElement.textContent = statusData.active_projects;
+                }
+
+                // Update total handoffs
+                const handoffsElement = document.getElementById('total-handoffs');
+                if (handoffsElement && statusData.total_handoffs !== undefined) {
+                    handoffsElement.textContent = statusData.total_handoffs;
+                }
+
+                // Update cost savings
+                const savingsElement = document.getElementById('cost-savings');
+                if (savingsElement && statusData.cost_savings !== undefined) {
+                    savingsElement.textContent = `$${statusData.cost_savings.toFixed(2)}`;
+                }
+
+                console.log('System status updated via SSE');
+            } catch (error) {
+                console.error('Error updating system status from SSE:', error);
+            }
+        }
+
+        // Update activity table from SSE data (flat view only for now)
+        function updateActivityTableFromSSE(activities) {
+            try {
+                // Only update if we're in flat view mode
+                if (isProjectView) {
+                    console.log('Skipping SSE activity update - in project view');
+                    return;
+                }
+
+                const tbody = document.querySelector('#activityTable tbody');
+                if (!tbody) {
+                    console.error('Activity table body not found');
+                    return;
+                }
+
+                // Clear existing rows
+                tbody.innerHTML = '';
+
+                // Add new rows
+                activities.forEach(activity => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${new Date(activity.timestamp).toLocaleString()}</td>
+                        <td>${escapeHtml(activity.session_id || 'N/A')}</td>
+                        <td>${escapeHtml(activity.event_type || 'N/A')}</td>
+                        <td>${escapeHtml(activity.model_or_agent || 'N/A')}</td>
+                        <td class="description-cell" title="${escapeHtml(activity.description || 'N/A')}">${escapeHtml((activity.description || 'N/A').substring(0, 50))}${(activity.description || '').length > 50 ? '...' : ''}</td>
+                        <td><span class="status-badge ${activity.status || 'unknown'}">${escapeHtml(activity.status || 'Unknown')}</span></td>
+                        <td>$${(activity.cost || 0).toFixed(4)}</td>
+                        <td>${escapeHtml(activity.project_name || 'Unknown')}</td>
+                    `;
+                    tbody.appendChild(row);
+                });
+
+                console.log('Activity table updated via SSE');
+            } catch (error) {
+                console.error('Error updating activity table from SSE:', error);
+            }
+        }
+
+        // Show SSE error status
+        function showSSEError(message) {
+            const liveIndicator = document.getElementById('liveIndicator');
+            if (liveIndicator) {
+                liveIndicator.textContent = `⚠️ ${message}`;
+                liveIndicator.style.display = 'inline-block';
+                liveIndicator.style.color = '#ff6b6b';
+            }
+        }
+
+        // Fallback polling if SSE fails
+        function setupFallbackPolling() {
+            console.log('Setting up fallback polling...');
+            autoRefreshInterval = setInterval(() => {
+                console.log('Fallback polling refresh...');
+                refreshAll();
+            }, 30000); // 30 second fallback
+        }
+
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
             refreshAll();
             initializeTooltips();
+            initializeSSE(); // Use SSE for real-time updates instead of polling
         });
+
+        function initializeAutoRefresh() {
+            if (isAutoRefresh) {
+                const toggle = document.getElementById('autoRefreshToggle');
+                const indicator = document.getElementById('liveIndicator');
+                toggle.classList.add('active');
+                indicator.style.display = 'inline-block';
+                autoRefreshInterval = setInterval(refreshAll, 30000); // 30 seconds
+            }
+        }
 
         // Tooltip System
         let currentTooltip = null;
@@ -684,7 +936,32 @@ async def dashboard():
 
             const tooltip = document.createElement('div');
             tooltip.className = 'tooltip';
-            tooltip.innerHTML = generateTooltipContent(type, data);
+
+            // Security: Sanitize and safely set HTML content
+            const content = generateTooltipContent(type, data);
+
+            // Create a temporary div to parse the HTML safely
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = content;
+
+            // Sanitize by removing any script tags or dangerous attributes
+            const scripts = tempDiv.querySelectorAll('script');
+            scripts.forEach(script => script.remove());
+
+            const allElements = tempDiv.querySelectorAll('*');
+            allElements.forEach(el => {
+                // Remove dangerous attributes
+                ['onclick', 'onload', 'onerror', 'onmouseover'].forEach(attr => {
+                    el.removeAttribute(attr);
+                });
+                // Remove any javascript: protocols
+                if (el.href && el.href.startsWith('javascript:')) {
+                    el.removeAttribute('href');
+                }
+            });
+
+            // Now safely append the sanitized content
+            tooltip.appendChild(tempDiv);
 
             document.body.appendChild(tooltip);
             currentTooltip = tooltip;
@@ -1160,22 +1437,51 @@ async def dashboard():
                         <div class="tooltip-subtitle">Comprehensive view of all AI orchestration activity across Claude Code sessions and DeepSeek handoffs.</div>
                     `;
 
+                case 'daily-activity':
+                    const todayTotal = (data.handoffs_today || 0) + (data.subagents_today || 0);
+                    return `
+                        <div class="tooltip-title">Today's AI Activity Breakdown</div>
+                        <div class="tooltip-item">
+                            <span class="tooltip-label">Claude → DeepSeek Handoffs:</span>
+                            <span class="tooltip-value">${data.handoffs_today || 0}</span>
+                        </div>
+                        <div class="tooltip-item">
+                            <span class="tooltip-label">Specialized Agents Used:</span>
+                            <span class="tooltip-value">${data.subagents_today || 0}</span>
+                        </div>
+                        <hr style="margin: 8px 0; border: none; border-top: 1px solid #e2e8f0;">
+                        <div class="tooltip-item">
+                            <span class="tooltip-label">Total Activities:</span>
+                            <span class="tooltip-value status-online">${todayTotal}</span>
+                        </div>
+                        <div class="tooltip-subtitle">Today's orchestration decisions routing tasks between Claude Code strategic work and DeepSeek local execution, plus specialized agent assistance for optimal cost/performance balance.</div>
+                    `;
+
                 case 'cost-optimization':
                     return `
-                        <div class="tooltip-title">Cost Optimization Performance</div>
+                        <div class="tooltip-title">AI Routing & Cost Optimization</div>
                         <div class="tooltip-item">
-                            <span class="tooltip-label">Optimization Rate:</span>
+                            <span class="tooltip-label">DeepSeek (Free) Handoffs:</span>
+                            <span class="tooltip-value status-online">${data.deepseek_handoffs}</span>
+                        </div>
+                        <div class="tooltip-item">
+                            <span class="tooltip-label">Claude (Paid) Handoffs:</span>
+                            <span class="tooltip-value">${data.claude_handoffs}</span>
+                        </div>
+                        <hr style="margin: 8px 0; border: none; border-top: 1px solid #e2e8f0;">
+                        <div class="tooltip-item">
+                            <span class="tooltip-label">Local Routing Rate:</span>
                             <span class="tooltip-value status-online">${data.optimization_rate}%</span>
                         </div>
                         <div class="tooltip-item">
-                            <span class="tooltip-label">Today's Savings:</span>
-                            <span class="tooltip-value">$${data.savings_today.toFixed(4)}</span>
+                            <span class="tooltip-label">Cost Avoided Today:</span>
+                            <span class="tooltip-value">$${(data.deepseek_handoffs * 0.015).toFixed(4)}</span>
                         </div>
                         <div class="tooltip-item">
-                            <span class="tooltip-label">Cost Avoided:</span>
-                            <span class="tooltip-value">$${data.cost_avoided.toFixed(4)}</span>
+                            <span class="tooltip-label">Actual Spend:</span>
+                            <span class="tooltip-value">$${data.estimated_claude_cost.toFixed(4)}</span>
                         </div>
-                        <div class="tooltip-subtitle">Percentage of tasks successfully routed to free local DeepSeek vs paid Claude API. Higher = better cost optimization.</div>
+                        <div class="tooltip-subtitle">Intelligent task routing: ${data.optimization_rate}% of workload processed locally for maximum cost efficiency. Estimated savings based on ~$0.015 per 1K tokens for Claude API calls.</div>
                     `;
 
                 case 'system-health':
@@ -1197,21 +1503,33 @@ async def dashboard():
                     `;
 
                 case 'daily-impact':
+                    const totalPotentialCost = data.total_handoffs * 0.015; // What all tasks would cost on Claude
+                    const actualCost = data.claude_handoffs * 0.015; // What we actually spent
+                    const savingsPercentage = totalPotentialCost > 0 ? Math.round(((totalPotentialCost - actualCost) / totalPotentialCost) * 100) : 0;
                     return `
-                        <div class="tooltip-title">Today's Impact Summary</div>
+                        <div class="tooltip-title">Today's AI Cost Impact</div>
                         <div class="tooltip-item">
-                            <span class="tooltip-label">Total Interactions:</span>
-                            <span class="tooltip-value">${data.total_interactions}</span>
+                            <span class="tooltip-label">Tasks Processed Locally:</span>
+                            <span class="tooltip-value status-online">${data.deepseek_handoffs}</span>
                         </div>
                         <div class="tooltip-item">
-                            <span class="tooltip-label">Projects Active:</span>
-                            <span class="tooltip-value">${data.projects_active}</span>
+                            <span class="tooltip-label">Tasks Sent to Claude:</span>
+                            <span class="tooltip-value">${data.claude_handoffs}</span>
+                        </div>
+                        <hr style="margin: 8px 0; border: none; border-top: 1px solid #e2e8f0;">
+                        <div class="tooltip-item">
+                            <span class="tooltip-label">Without Optimization:</span>
+                            <span class="tooltip-value">$${totalPotentialCost.toFixed(4)}</span>
                         </div>
                         <div class="tooltip-item">
-                            <span class="tooltip-label">Efficiency Gain:</span>
-                            <span class="tooltip-value status-online">${data.efficiency_gain}</span>
+                            <span class="tooltip-label">Actual Cost:</span>
+                            <span class="tooltip-value">$${actualCost.toFixed(4)}</span>
                         </div>
-                        <div class="tooltip-subtitle">Daily summary showing the productivity and cost impact of the AI orchestration system.</div>
+                        <div class="tooltip-item">
+                            <span class="tooltip-label">Cost Reduction:</span>
+                            <span class="tooltip-value status-online">${savingsPercentage}%</span>
+                        </div>
+                        <div class="tooltip-subtitle">Real cost savings from routing ${data.deepseek_handoffs} tasks to free local DeepSeek instead of paid Claude API. Based on average $0.015 per task.</div>
                     `;
 
                 default:
@@ -1244,30 +1562,52 @@ async def dashboard():
         }
 
         async function loadSystemStatus() {
-            const response = await fetch('/api/system-status');
-            const data = await response.json();
+            try {
+                console.log('Loading system status...');
+                const response = await fetch('/api/system-status');
 
-            const statusBar = document.getElementById('statusBar');
-            // Enhanced status bar with comprehensive Claude + DeepSeek metrics
-            const aiSystemData = {
-                claude_status: 'ACTIVE', // Claude Code is always active when dashboard is running
-                deepseek_status: data.deepseek.available ? 'CONNECTED' : 'OFFLINE',
-                deepseek_response_time: data.deepseek.response_time || 0,
-                combined_health: data.deepseek.available ? 'OPTIMAL' : 'DEGRADED'
-            };
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                console.log('System status data:', data);
+
+                const statusBar = document.getElementById('statusBar');
+                if (!statusBar) {
+                    console.error('Status bar element not found');
+                    return;
+                }
+
+                // Enhanced status bar with comprehensive Claude + DeepSeek metrics
+                const aiSystemData = {
+                    claude_status: data.claude?.available ? 'ACTIVE' : 'OFFLINE',
+                    claude_sessions_today: data.claude?.sessions_today || 0,
+                    deepseek_status: data.deepseek?.available ? 'CONNECTED' : 'OFFLINE',
+                    deepseek_response_time: data.deepseek?.response_time || 0,
+                    deepseek_handoffs_today: data.deepseek_handoffs_today || 0,
+                    combined_health: data.combined_health ? data.combined_health.toUpperCase() : 'DEGRADED'
+                };
 
             const orchestrationData = {
                 total_sessions: data.active_sessions || 0,
+                sessions_today: data.claude?.sessions_today || 0, // Today's new sessions
                 handoffs_today: data.handoffs_today || 0,
-                claude_tasks: Math.floor((data.handoffs_today || 0) * 0.3), // Estimated Claude tasks
-                deepseek_tasks: Math.floor((data.handoffs_today || 0) * 0.7), // Estimated DeepSeek tasks
+                claude_tasks: data.handoffs_today - (data.deepseek_handoffs_today || 0), // Actual Claude tasks
+                deepseek_tasks: data.deepseek_handoffs_today || 0, // Actual DeepSeek tasks
                 subagents_today: data.subagents_spawned || 0
             };
 
             const costOptimizationData = {
                 savings_today: data.savings_today || 0,
                 cost_avoided: (data.savings_today || 0) * 1.2, // Including indirect savings
-                optimization_rate: data.deepseek.available ? 85 : 45 // % of tasks routed to free DeepSeek
+                deepseek_handoffs: data.deepseek_handoffs_today || 0,
+                total_handoffs: data.handoffs_today || 0,
+                claude_handoffs: (data.handoffs_today || 0) - (data.deepseek_handoffs_today || 0),
+                optimization_rate: data.handoffs_today > 0 ?
+                    Math.round(((data.deepseek_handoffs_today || 0) / (data.handoffs_today || 0)) * 100) : 0,
+                estimated_claude_cost: ((data.handoffs_today || 0) - (data.deepseek_handoffs_today || 0)) * 0.015, // $0.015 per 1K tokens avg
+                estimated_deepseek_cost: 0.00 // DeepSeek is free (local)
             };
 
             const systemHealthData = {
@@ -1279,23 +1619,26 @@ async def dashboard():
             const todayImpactData = {
                 total_interactions: (data.handoffs_today || 0) + (data.subagents_spawned || 0),
                 projects_active: Math.min(Math.ceil(data.active_sessions / 3), 8),
-                efficiency_gain: data.deepseek.available ? '3.2x' : '1.1x'
+                efficiency_gain: data.deepseek.available ? '3.2x' : '1.1x',
+                total_handoffs: data.handoffs_today || 0,
+                deepseek_handoffs: data.deepseek_handoffs_today || 0,
+                claude_handoffs: (data.handoffs_today || 0) - (data.deepseek_handoffs_today || 0)
             };
 
             statusBar.innerHTML = `
                 <div class="status-item">
-                    <span class="status-value ${data.deepseek.available ? 'status-online' : 'status-offline'}"
+                    <span class="status-value ${aiSystemData.combined_health === 'OPTIMAL' ? 'status-online' : 'status-offline'}"
                           data-tooltip="ai-system-status" data-tooltip-data='${JSON.stringify(aiSystemData).replace(/'/g, "&apos;")}'>
                         ${aiSystemData.combined_health}
                     </span>
                     <label>AI System Status</label>
                 </div>
                 <div class="status-item">
-                    <span class="status-value" data-tooltip="orchestration-activity"
+                    <span class="status-value" data-tooltip="daily-activity"
                           data-tooltip-data='${JSON.stringify(orchestrationData).replace(/'/g, "&apos;")}'>
-                        ${orchestrationData.total_sessions + orchestrationData.handoffs_today + orchestrationData.subagents_today}
+                        ${orchestrationData.handoffs_today + orchestrationData.subagents_today}
                     </span>
-                    <label>Total Orchestration Activity</label>
+                    <label>Today's AI Activity</label>
                 </div>
                 <div class="status-item">
                     <span class="status-value status-online" data-tooltip="cost-optimization"
@@ -1316,9 +1659,31 @@ async def dashboard():
                           data-tooltip-data='${JSON.stringify(todayImpactData).replace(/'/g, "&apos;")}'>
                         $${(data.savings_today || 0).toFixed(2)}
                     </span>
-                    <label>Today's Cost Savings</label>
+                    <label>Today's AI Savings</label>
                 </div>
             `;
+
+                console.log('Status bar updated successfully');
+            } catch (error) {
+                console.error('Error loading system status:', error);
+                const statusBar = document.getElementById('statusBar');
+                if (statusBar) {
+                    statusBar.innerHTML = `
+                        <div class="status-item">
+                            <span class="status-value status-offline">ERROR</span>
+                            <label>System Status</label>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-value">--</span>
+                            <label>Loading...</label>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-value">--</span>
+                            <label>Please Refresh</label>
+                        </div>
+                    `;
+                }
+            }
         }
 
         async function loadHandoffAnalytics() {
@@ -1670,6 +2035,17 @@ async def dashboard():
             });
         }
 
+        // Security: HTML escaping function to prevent XSS
+        function escapeHtml(unsafe) {
+            if (typeof unsafe !== 'string') return unsafe;
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
         async function loadRecentActivity(page = 1) {
             try {
                 const response = await fetch(`/api/recent-activity?page=${page}&limit=50`);
@@ -1680,17 +2056,26 @@ async def dashboard():
                     activityPagination = data.pagination;
 
                     const tbody = document.getElementById('activityBody');
-                    tbody.innerHTML = data.activities.map(activity => `
-                        <tr>
-                            <td>${new Date(activity.timestamp).toLocaleTimeString()}</td>
-                            <td>${activity.session_id?.substring(0, 8) || 'N/A'}</td>
-                            <td>${activity.event_type}</td>
-                            <td class="model-${activity.model_or_agent?.toLowerCase() || ''}">${activity.model_or_agent || 'Unknown'}</td>
-                            <td>${activity.description?.substring(0, 50) || ''}${activity.description?.length > 50 ? '...' : ''}</td>
-                            <td class="${activity.status}">${activity.status}</td>
+                    tbody.innerHTML = data.activities.map(activity => {
+                        // Determine data quality/type
+                        const isHistorical = activity.session_id?.startsWith('migrated_');
+                        const isOld = new Date() - new Date(activity.timestamp) > 24 * 60 * 60 * 1000; // Older than 24 hours
+                        const dataQualityClass = isHistorical ? 'historical-data' : (isOld ? 'old-data' : 'recent-data');
+                        const dataQualityIndicator = isHistorical ? ' 📁' : (isOld ? ' ⏰' : ' 🟢');
+
+                        return `
+                        <tr class="${dataQualityClass}">
+                            <td>${new Date(activity.timestamp).toLocaleString()}${dataQualityIndicator}</td>
+                            <td>${escapeHtml(activity.session_id?.substring(0, 8)) || 'N/A'}</td>
+                            <td>${escapeHtml(activity.event_type)}</td>
+                            <td class="model-${escapeHtml(activity.model_or_agent?.toLowerCase()) || ''}">${escapeHtml(activity.model_or_agent) || 'Unknown'}</td>
+                            <td>${escapeHtml(activity.description?.substring(0, 50)) || ''}${activity.description?.length > 50 ? '...' : ''}</td>
+                            <td class="${escapeHtml(activity.status)}">${escapeHtml(activity.status)}</td>
                             <td>$${(activity.cost || 0).toFixed(3)}</td>
+                            <td>${escapeHtml(activity.project_name) || 'Unknown'}</td>
                         </tr>
-                    `).join('');
+                        `;
+                    }).join('');
 
                     // Update pagination info
                     updateActivityPagination();
@@ -2086,22 +2471,51 @@ async def dashboard():
 # API Endpoints
 @app.route("/api/system-status")
 async def system_status():
-    """Get current system status"""
+    """Get current system status with comprehensive Claude Code + DeepSeek metrics"""
     deepseek_health = deepseek_client.get_health_status()
 
-    # Get today's metrics
-    today = datetime.now().date()
-    today_start = datetime.combine(today, datetime.min.time())
-    today_end = datetime.combine(today, datetime.max.time())
+    # Get today's actual activity using proper SQLite date functions
+    today_sessions = db.conn.execute("""
+        SELECT COUNT(*) FROM orchestration_sessions
+        WHERE DATE(start_time) = DATE('now', 'localtime')
+    """).fetchone()[0]
 
-    handoff_analytics = db.get_handoff_analytics(today_start.isoformat(), today_end.isoformat())
+    today_handoffs = db.conn.execute("""
+        SELECT COUNT(*) FROM handoff_events
+        WHERE DATE(timestamp) = DATE('now', 'localtime')
+    """).fetchone()[0]
+
+    today_subagents = db.conn.execute("""
+        SELECT COUNT(*) FROM subagent_invocations
+        WHERE DATE(timestamp) = DATE('now', 'localtime')
+    """).fetchone()[0]
+
+    # Calculate today's savings (estimated based on handoffs to DeepSeek)
+    deepseek_handoffs_today = db.conn.execute("""
+        SELECT COUNT(*) FROM handoff_events
+        WHERE DATE(timestamp) = DATE('now', 'localtime') AND target_model = 'deepseek'
+    """).fetchone()[0]
+
+    # Estimate savings: ~$0.015 per DeepSeek handoff (average task cost saved)
+    estimated_savings = deepseek_handoffs_today * 0.015
+
+    # Claude Code status - always ACTIVE if the dashboard is running
+    claude_status = {
+        'available': True,
+        'status': 'active',
+        'sessions_today': today_sessions,
+        'orchestration_active': True
+    }
 
     return jsonify({
+        'claude': claude_status,
         'deepseek': deepseek_health,
-        'active_sessions': 0,  # TODO: Implement active session counting
-        'handoffs_today': handoff_analytics.get('total_handoffs', 0),
-        'subagents_spawned': 0,  # TODO: Implement subagent counting
-        'savings_today': handoff_analytics.get('total_savings', 0)
+        'active_sessions': today_sessions,
+        'handoffs_today': today_handoffs,
+        'subagents_spawned': today_subagents,
+        'savings_today': estimated_savings,
+        'deepseek_handoffs_today': deepseek_handoffs_today,
+        'combined_health': 'optimal' if (claude_status['available'] and deepseek_health['available']) else 'degraded'
     })
 
 @app.route("/api/handoff-analytics")
@@ -2206,50 +2620,184 @@ async def account_transition_analysis():
         logger.error(f"Error getting account transition analysis: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route("/api/events")
+async def sse_events():
+    """Server-Sent Events endpoint for real-time dashboard updates"""
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        """Generate SSE events with real-time dashboard data"""
+        last_update_time = datetime.now()
+
+        while True:
+            try:
+                # Get current data
+                status_data = await system_status()
+                status_json = await status_data.get_json()
+
+                # Get recent activity
+                activity_data = await recent_activity()
+                activity_json = await activity_data.get_json()
+
+                # Create update event
+                update_data = {
+                    'type': 'dashboard_update',
+                    'timestamp': datetime.now().isoformat() + 'Z',
+                    'system_status': status_json,
+                    'recent_activity': activity_json.get('activities', [])[:5],  # Latest 5 activities
+                    'update_count': int((datetime.now() - last_update_time).total_seconds())
+                }
+
+                # Send SSE event
+                yield f"data: {json.dumps(update_data)}\n\n"
+
+                # Update every 5 seconds (much faster than 30s polling)
+                await asyncio.sleep(5)
+
+            except Exception as e:
+                logger.error(f"SSE error: {e}")
+                # Send error event
+                error_data = {
+                    'type': 'error',
+                    'message': 'Dashboard update failed',
+                    'timestamp': datetime.now().isoformat() + 'Z'
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+                await asyncio.sleep(10)  # Wait longer on error
+
+    return Response(
+        event_stream(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Cache-Control'
+        }
+    )
+
 # Track new session endpoint
 @app.route("/api/track/session", methods=['POST'])
 async def track_session():
     """Track new orchestration session"""
-    data = await request.get_json()
+    try:
+        data = await request.get_json()
 
-    session_id = db.create_session(
-        session_id=data['session_id'],
-        project_name=data.get('project_name'),
-        task_description=data.get('task_description'),
-        metadata=data.get('metadata')
-    )
+        session_id = db.create_session(
+            session_id=data['session_id'],
+            project_name=data.get('project_name'),
+            task_description=data.get('task_description'),
+            metadata=data.get('metadata')
+        )
 
-    return jsonify({'session_id': session_id, 'status': 'success'})
+        return jsonify({'session_id': session_id, 'status': 'success'})
+
+    except Exception as e:
+        # Handle unique constraint violations gracefully
+        if "UNIQUE constraint failed" in str(e):
+            logger.warning(f"Session {data.get('session_id', 'unknown')} already exists, returning existing session")
+            return jsonify({'session_id': data['session_id'], 'status': 'exists'})
+        else:
+            logger.error(f"Error tracking session: {e}")
+            return jsonify({'error': str(e), 'status': 'error'}), 500
 
 # Track handoff endpoint
 @app.route("/api/track/handoff", methods=['POST'])
 async def track_handoff():
     """Track model handoff event"""
-    data = await request.get_json()
+    try:
+        data = await request.get_json()
 
-    handoff_id = handoff_monitor.track_handoff(
-        session_id=data['session_id'],
-        task_description=data['task_description'],
-        task_type=data.get('task_type', 'general'),
-        decision=None,  # Would be provided if decision was made
-        actual_model=data.get('actual_model')
-    )
+        # Handle decision data - convert from dict to HandoffDecision if provided
+        decision = None
+        if 'decision' in data and data['decision'] is not None:
+            decision_data = data['decision']
+            if isinstance(decision_data, dict):
+                from src.tracking.handoff_monitor import HandoffDecision
+                decision = HandoffDecision(
+                    should_route_to_deepseek=decision_data.get('should_route_to_deepseek', False),
+                    confidence=decision_data.get('confidence', 0.5),
+                    reasoning=decision_data.get('reasoning', 'No reasoning provided'),
+                    estimated_tokens=decision_data.get('estimated_tokens', 100),
+                    cost_savings=decision_data.get('cost_savings', 0.0),
+                    route_reason=decision_data.get('route_reason', 'Default routing'),
+                    response_time_estimate=decision_data.get('response_time_estimate', 1.0)
+                )
+            else:
+                decision = decision_data
 
-    return jsonify({'handoff_id': handoff_id, 'status': 'success'})
+        handoff_id = handoff_monitor.track_handoff(
+            session_id=data['session_id'],
+            task_description=data['task_description'],
+            task_type=data.get('task_type', 'general'),
+            decision=decision,
+            actual_model=data.get('actual_model')
+        )
+
+        return jsonify({'handoff_id': handoff_id, 'status': 'success'})
+
+    except Exception as e:
+        logger.error(f"Error tracking handoff: {e}")
+        return jsonify({'error': str(e), 'status': 'error'}), 500
+
+# Simple test endpoint to verify route registration
+@app.route("/api/test/subagent", methods=['GET'])
+async def test_subagent_route():
+    """Test endpoint to verify route registration"""
+    return jsonify({'status': 'route_working', 'message': 'Subagent route is accessible'})
 
 # Track subagent endpoint
 @app.route("/api/track/subagent", methods=['POST'])
 async def track_subagent():
-    """Track subagent invocation"""
-    data = await request.get_json()
+    """Track subagent invocation - simplified version"""
+    try:
+        # Write to debug file immediately
+        with open("debug_subagent.log", "w", encoding="utf-8") as f:
+            f.write("[DEBUG] Subagent endpoint reached!\n")
 
-    invocation_id = subagent_tracker.track_invocation(
-        session_id=data['session_id'],
-        invocation=data['invocation'],  # SubagentInvocation object
-        parent_agent=data.get('parent_agent')
-    )
+        # Get and validate data
+        data = await request.get_json()
 
-    return jsonify({'invocation_id': invocation_id, 'status': 'success'})
+        with open("debug_subagent.log", "a", encoding="utf-8") as f:
+            f.write(f"[DEBUG] Received data: {data}\n")
+
+        if not data or 'session_id' not in data or 'invocation' not in data:
+            return jsonify({'error': 'Missing required fields', 'status': 'error'}), 400
+
+        # Extract invocation data
+        invocation_data = data['invocation']
+        session_id = data['session_id']
+
+        # Create SubagentInvocation object
+        invocation = SubagentInvocation(
+            agent_type=invocation_data.get('agent_type', 'specialized'),
+            agent_name=invocation_data.get('agent_name', 'unknown'),
+            trigger_phrase=invocation_data.get('trigger_phrase', ''),
+            task_description=invocation_data.get('task_description', ''),
+            parent_agent=invocation_data.get('parent_agent', 'claude'),
+            confidence=float(invocation_data.get('confidence', 0.8)),
+            estimated_complexity=invocation_data.get('estimated_complexity', 'medium')
+        )
+
+        # Track the invocation
+        invocation_id = subagent_tracker.track_invocation(
+            session_id=session_id,
+            invocation=invocation,
+            parent_agent=data.get('parent_agent', 'claude')
+        )
+
+        with open("debug_subagent.log", "a", encoding="utf-8") as f:
+            f.write(f"[SUCCESS] Created invocation ID: {invocation_id}\n")
+
+        return jsonify({'invocation_id': invocation_id, 'status': 'success'})
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Error: {e}\nTraceback: {traceback.format_exc()}"
+
+        with open("debug_subagent.log", "a", encoding="utf-8") as f:
+            f.write(f"[ERROR] {error_msg}\n")
+
+        return jsonify({'error': str(e), 'status': 'error'}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)
