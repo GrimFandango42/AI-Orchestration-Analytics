@@ -1,22 +1,23 @@
-# 🚀 AI Orchestration Analytics Platform
+# 🚀 AI Cost Intelligence & Orchestration Analytics Platform
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: Production Ready](https://img.shields.io/badge/Status-Production%20Ready-green.svg)]()
 [![Tests: Passing](https://img.shields.io/badge/Tests-14%2F14%20Passing-brightgreen.svg)]()
 
-> **Professional-grade analytics platform for AI orchestration optimization.** Tracks Claude Code usage patterns, DeepSeek handoffs, and subagent invocations to achieve **90% cost reduction** while maintaining quality.
+> **Unified AI cost intelligence and orchestration analytics platform.** Comprehensive cost tracking, smart routing, and real-time analytics to achieve **90% cost reduction** while maintaining quality. **Consolidated from AI-Cost-Intelligence-Platform and AI-Orchestration-Analytics into a single, unified solution.**
 
 ## Overview
 
-AI Orchestration Analytics provides comprehensive real-time monitoring and optimization for AI development workflows. Track Claude Code orchestration patterns, optimize DeepSeek handoffs, and analyze subagent usage to achieve up to 90% cost reduction while maintaining quality.
+The AI Cost Intelligence & Orchestration Analytics Platform provides end-to-end cost monitoring and optimization for AI development workflows. This unified platform combines intelligent data collection, cost calculation, routing optimization, and comprehensive analytics visualization in a single, integrated solution.
 
 ### Key Capabilities
+- 💰 **Cost Intelligence** - Comprehensive cost tracking and LLM usage optimization
 - 🎯 **Orchestration Tracking** - Monitor Claude Code usage patterns and session analytics
 - 🔄 **Smart Handoffs** - Intelligent task routing between Claude and DeepSeek with 95% accuracy
 - 🤖 **Subagent Analytics** - Track and optimize specialized agent invocations
-- 💰 **Cost Optimization** - Real-time savings tracking with $140-185/month potential
-- 📊 **Interactive Dashboard** - Professional web interface with drill-down analytics
+- 📊 **Unified Dashboard** - Real-time analytics visualization layer with drill-down capabilities
+- 🔗 **Dual Port Support** - Development (port 3000) and production (port 8000) deployment
 
 ## Quick Start
 
@@ -37,7 +38,8 @@ python src/launch.py
 ```
 
 ### Access Dashboard
-Open [http://localhost:8000](http://localhost:8000) in your browser.
+- **Production Dashboard**: [http://localhost:8000](http://localhost:8000) (main analytics interface)
+- **Development Dashboard**: [http://localhost:3000](http://localhost:3000) (testing and debugging)
 
 ## 🤖 Subagent Detection
 

@@ -18,7 +18,8 @@ sys.path.insert(0, str(project_root))
 from src.core.database import OrchestrationDB
 from src.tracking.handoff_monitor import HandoffMonitor, DeepSeekClient
 from src.tracking.subagent_tracker import SubagentTracker
-from src.dashboard.orchestration_dashboard import app
+from src.dashboard.realtime_dashboard import app
+from src.instrumentation.realtime_pipeline import RealTimePipeline
 
 # Configure logging
 logging.basicConfig(
@@ -40,6 +41,9 @@ class OrchestrationAnalytics:
         self.handoff_monitor = None
         self.subagent_tracker = None
         self.deepseek_client = None
+        self.realtime_pipeline = None
+        self.activity_broadcaster = None
+        self.activity_generator = None
         self.running = False
 
     async def initialize(self):
@@ -66,20 +70,66 @@ class OrchestrationAnalytics:
         else:
             logger.warning(f"DeepSeek not available: {deepseek_status.get('error', 'Unknown error')}")
 
+        # Initialize real-time instrumentation pipeline
+        self.realtime_pipeline = RealTimePipeline(self.db)
+        await self.realtime_pipeline.initialize()
+        logger.info("Real-time instrumentation pipeline initialized")
+
+        # Initialize live activity broadcasting system
+        try:
+            from src.tracking.live_activity_broadcaster import create_activity_system
+            self.activity_broadcaster, self.activity_generator = create_activity_system(self.db)
+            # Note: WebSocket server will start when dashboard starts
+            logger.info("Live activity broadcasting system initialized")
+        except ImportError as e:
+            logger.warning(f"Could not initialize live activity system: {e}")
+            self.activity_broadcaster = None
+            self.activity_generator = None
+
+        # Demonstrate the instrumentation system
+        asyncio.create_task(self._delayed_demonstration())
+
         self.running = True
-        logger.info("SUCCESS: Orchestration Analytics initialized successfully")
+        logger.info("SUCCESS: Orchestration Analytics with Real-Time Monitoring initialized successfully")
 
     async def start_dashboard(self, host='127.0.0.1', port=8000):
         """Start the web dashboard"""
         logger.info(f"Starting dashboard on http://{host}:{port}")
 
         try:
-            # Set global instances for dashboard
+            # Set global instances for both dashboard modules
             import src.dashboard.orchestration_dashboard as dashboard_module
+            import src.dashboard.realtime_dashboard as realtime_module
+
+            # Set globals for orchestration dashboard
             dashboard_module.db = self.db
             dashboard_module.handoff_monitor = self.handoff_monitor
             dashboard_module.subagent_tracker = self.subagent_tracker
             dashboard_module.deepseek_client = self.deepseek_client
+            dashboard_module.realtime_pipeline = self.realtime_pipeline
+
+            # Set globals for realtime dashboard (which we're actually using)
+            realtime_module.db = self.db
+            realtime_module.handoff_monitor = self.handoff_monitor
+            realtime_module.subagent_tracker = self.subagent_tracker
+            realtime_module.deepseek_client = self.deepseek_client
+            realtime_module.realtime_pipeline = self.realtime_pipeline
+
+            # Start live activity WebSocket server if available
+            if self.activity_broadcaster:
+                try:
+                    await self.activity_broadcaster.start_server()
+                    logger.info(f"Live activity WebSocket server started on ws://localhost:{self.activity_broadcaster.port}")
+
+                    # Generate some initial activity events
+                    if self.activity_generator:
+                        self.activity_generator.generate_system_activity('START', {
+                            'message': 'AI Orchestration Analytics started',
+                            'version': '1.0',
+                            'dashboard_url': f'http://{host}:{port}'
+                        })
+                except Exception as e:
+                    logger.warning(f"Could not start live activity WebSocket server: {e}")
 
             await app.run_task(host=host, port=port, debug=False)
         except Exception as e:
@@ -88,6 +138,8 @@ class OrchestrationAnalytics:
 
     async def run_health_checks(self):
         """Run periodic health checks"""
+        cleanup_counter = 0
+
         while self.running:
             try:
                 # Check DeepSeek health
@@ -101,6 +153,17 @@ class OrchestrationAnalytics:
 
                 logger.info(f"Health check - Handoffs: {handoff_analytics.get('total_handoffs', 0)}, "
                           f"Subagents: {len(subagent_analytics.get('usage_statistics', []))}")
+
+                # Run activity cleanup every 6th health check (30 minutes)
+                cleanup_counter += 1
+                if cleanup_counter >= 6:
+                    try:
+                        cleanup_count = self.db.cleanup_old_activities(days_to_keep=7)
+                        if cleanup_count > 0:
+                            logger.info(f"Cleaned up {cleanup_count} old activities (older than 7 days)")
+                    except Exception as cleanup_error:
+                        logger.error(f"Activity cleanup error: {cleanup_error}")
+                    cleanup_counter = 0
 
             except Exception as e:
                 logger.error(f"Health check error: {e}")
@@ -169,10 +232,24 @@ class OrchestrationAnalytics:
 
         logger.info("SUCCESS: Test data generated successfully")
 
+    async def _delayed_demonstration(self):
+        """Demonstrate the instrumentation system after a brief startup delay"""
+        await asyncio.sleep(5)  # Wait 5 seconds for system to fully start
+        if self.realtime_pipeline:
+            await self.realtime_pipeline.demonstrate_instrumentation()
+
     async def shutdown(self):
         """Gracefully shutdown the system"""
         logger.info("Shutting down Orchestration Analytics...")
         self.running = False
+
+        # Shutdown real-time pipeline
+        if self.realtime_pipeline:
+            await self.realtime_pipeline.shutdown()
+
+        # Shutdown live activity WebSocket server
+        if self.activity_broadcaster:
+            await self.activity_broadcaster.stop_server()
 
         if self.db:
             self.db.close()

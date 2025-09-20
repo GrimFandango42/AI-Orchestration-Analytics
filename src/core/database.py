@@ -222,6 +222,136 @@ class OrchestrationDB:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_type_time ON pattern_analysis(pattern_type, timestamp DESC)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_period ON cost_metrics(period_type, period_start)")
 
+            # Token orchestration tables for enhanced routing
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS token_budgets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    project_name TEXT,
+                    initial_budget INTEGER DEFAULT 5000,
+                    current_budget INTEGER DEFAULT 5000,
+                    claude_tokens_used INTEGER DEFAULT 0,
+                    deepseek_tokens_used INTEGER DEFAULT 0,
+                    other_tokens_used INTEGER DEFAULT 0,
+                    budget_exhausted BOOLEAN DEFAULT FALSE,
+                    priority_level TEXT DEFAULT 'medium',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES orchestration_sessions(session_id)
+                )
+            """)
+
+            # Model capacity thresholds
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS model_capacity_thresholds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_name TEXT NOT NULL,
+                    vendor TEXT NOT NULL,
+                    capacity_threshold REAL DEFAULT 0.8,
+                    cost_per_token REAL DEFAULT 0.0,
+                    quality_score REAL DEFAULT 1.0,
+                    speed_score REAL DEFAULT 1.0,
+                    availability_score REAL DEFAULT 1.0,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    metadata TEXT
+                )
+            """)
+
+            # Routing decisions log
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS routing_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    task_description TEXT,
+                    task_complexity TEXT,
+                    quality_requirement REAL,
+                    speed_requirement TEXT,
+                    cost_budget REAL,
+                    selected_model TEXT,
+                    selected_vendor TEXT,
+                    routing_score REAL,
+                    routing_factors TEXT,
+                    alternatives_considered TEXT,
+                    confidence_score REAL,
+                    execution_success BOOLEAN,
+                    actual_cost REAL,
+                    actual_tokens INTEGER,
+                    actual_duration REAL,
+                    user_satisfaction REAL,
+                    metadata TEXT,
+                    FOREIGN KEY (session_id) REFERENCES orchestration_sessions(session_id)
+                )
+            """)
+
+            # Model performance tracking
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS model_performance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_name TEXT NOT NULL,
+                    vendor TEXT NOT NULL,
+                    task_type TEXT,
+                    complexity_level TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    response_time REAL,
+                    tokens_used INTEGER,
+                    cost REAL,
+                    quality_score REAL,
+                    success_rate REAL,
+                    error_count INTEGER DEFAULT 0,
+                    retry_count INTEGER DEFAULT 0,
+                    user_rating REAL,
+                    project_context TEXT,
+                    metadata TEXT
+                )
+            """)
+
+            # Claude Code hooks tracking
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS claude_code_hooks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    hook_type TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    trigger_event TEXT,
+                    hook_data TEXT,
+                    processing_time REAL,
+                    success BOOLEAN DEFAULT TRUE,
+                    error_message TEXT,
+                    metadata TEXT,
+                    FOREIGN KEY (session_id) REFERENCES orchestration_sessions(session_id)
+                )
+            """)
+
+            # Indexes for new tables
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_token_budgets_session ON token_budgets(session_id)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_token_budgets_project ON token_budgets(project_name, updated_at DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_model_capacity_vendor ON model_capacity_thresholds(vendor, model_name)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_routing_decisions_session ON routing_decisions(session_id, timestamp DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_routing_decisions_model ON routing_decisions(selected_model, timestamp DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_model_performance_model ON model_performance(model_name, vendor, timestamp DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_model_performance_task_type ON model_performance(task_type, complexity_level, timestamp DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_claude_hooks_session ON claude_code_hooks(session_id, timestamp DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_claude_hooks_type ON claude_code_hooks(hook_type, timestamp DESC)")
+
+            # Live activities table for real-time tracking
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS live_activities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    session_id TEXT,
+                    data JSON NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    processed BOOLEAN DEFAULT FALSE,
+                    priority INTEGER DEFAULT 1
+                )
+            """)
+
+            # Create indexes for live activities table
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON live_activities(timestamp DESC)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_event_type ON live_activities(event_type)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_session ON live_activities(session_id)")
+
     def _init_attribution_systems(self):
         """Initialize project attribution and MCP detection systems"""
         try:
@@ -349,6 +479,18 @@ class OrchestrationDB:
                     SET {', '.join(updates)}
                     WHERE session_id = ?
                 """, values)
+
+    def track_session(self, session_id: str, project_name: str = None,
+                     task_description: str = None, metadata: Dict = None,
+                     working_directory: str = None, start_time=None, **kwargs) -> int:
+        """Simple wrapper around create_session for real-time instrumentation"""
+        return self.create_session(
+            session_id=session_id,
+            project_name=project_name,
+            task_description=task_description,
+            metadata=metadata,
+            working_directory=working_directory
+        )
 
     # Handoff Tracking
     def track_handoff(self, session_id: str, task_type: str, task_description: str,
@@ -643,40 +785,48 @@ class OrchestrationDB:
         total_count_cursor = self.conn.execute("""
             SELECT COUNT(*) as total FROM (
                 SELECT start_time as timestamp, 'session' as event_type, session_id, project_name as description,
-                       0 as cost, 'claude' as model_or_agent, 'success' as status
+                       0 as cost, 'claude' as model_or_agent, 'success' as status, project_name
                 FROM orchestration_sessions
                 UNION ALL
-                SELECT timestamp, 'handoff' as event_type, session_id,
-                       task_description as description, cost, target_model as model_or_agent,
-                       CASE WHEN success = 1 THEN 'success' ELSE 'failed' END as status
-                FROM handoff_events
+                SELECT h.timestamp, 'handoff' as event_type, h.session_id,
+                       h.task_description as description, h.cost, h.target_model as model_or_agent,
+                       CASE WHEN h.success = 1 THEN 'success' ELSE 'failed' END as status,
+                       COALESCE(s.project_name, 'Unknown') as project_name
+                FROM handoff_events h
+                LEFT JOIN orchestration_sessions s ON h.session_id = s.session_id
                 UNION ALL
-                SELECT timestamp, 'subagent' as event_type, session_id,
-                       task_description as description, cost, agent_name as model_or_agent,
-                       CASE WHEN success = 1 THEN 'success' ELSE 'failed' END as status
-                FROM subagent_invocations
+                SELECT sub.timestamp, 'subagent' as event_type, sub.session_id,
+                       sub.task_description as description, sub.cost, sub.agent_name as model_or_agent,
+                       CASE WHEN sub.success = 1 THEN 'success' ELSE 'failed' END as status,
+                       COALESCE(s.project_name, 'Unknown') as project_name
+                FROM subagent_invocations sub
+                LEFT JOIN orchestration_sessions s ON sub.session_id = s.session_id
             )
         """)
         total_count = total_count_cursor.fetchone()[0]
 
         # Get paginated activities
         cursor = self.conn.execute("""
-            SELECT timestamp, event_type, session_id, description, cost, model_or_agent, status
+            SELECT timestamp, event_type, session_id, description, cost, model_or_agent, status, project_name
             FROM (
                 SELECT start_time as timestamp, 'session' as event_type, session_id,
                        project_name as description, 0 as cost, 'claude' as model_or_agent,
-                       'success' as status
+                       'success' as status, project_name
                 FROM orchestration_sessions
                 UNION ALL
-                SELECT timestamp, 'handoff' as event_type, session_id,
-                       task_description as description, cost, target_model as model_or_agent,
-                       CASE WHEN success = 1 THEN 'success' ELSE 'failed' END as status
-                FROM handoff_events
+                SELECT h.timestamp, 'handoff' as event_type, h.session_id,
+                       h.task_description as description, h.cost, h.target_model as model_or_agent,
+                       CASE WHEN h.success = 1 THEN 'success' ELSE 'failed' END as status,
+                       COALESCE(s.project_name, 'Unknown') as project_name
+                FROM handoff_events h
+                LEFT JOIN orchestration_sessions s ON h.session_id = s.session_id
                 UNION ALL
-                SELECT timestamp, 'subagent' as event_type, session_id,
-                       task_description as description, cost, agent_name as model_or_agent,
-                       CASE WHEN success = 1 THEN 'success' ELSE 'failed' END as status
-                FROM subagent_invocations
+                SELECT sub.timestamp, 'subagent' as event_type, sub.session_id,
+                       sub.task_description as description, sub.cost, sub.agent_name as model_or_agent,
+                       CASE WHEN sub.success = 1 THEN 'success' ELSE 'failed' END as status,
+                       COALESCE(s.project_name, 'Unknown') as project_name
+                FROM subagent_invocations sub
+                LEFT JOIN orchestration_sessions s ON sub.session_id = s.session_id
             )
             ORDER BY timestamp DESC
             LIMIT ? OFFSET ?
@@ -687,6 +837,12 @@ class OrchestrationDB:
             activity = dict(row)
             # Ensure proper data types
             activity['cost'] = float(activity['cost']) if activity['cost'] else 0.0
+
+            # Fix timezone handling: Add 'Z' suffix to indicate UTC timestamps
+            # Database stores UTC timestamps without timezone info, so we need to indicate this to frontend
+            if activity.get('timestamp') and not activity['timestamp'].endswith('Z'):
+                activity['timestamp'] = activity['timestamp'] + 'Z'
+
             activities.append(activity)
 
         # Calculate pagination info
@@ -755,6 +911,11 @@ class OrchestrationDB:
 
             handoffs = [dict(row) for row in handoffs_cursor.fetchall()]
 
+            # Fix timezone handling for handoffs: Add 'Z' suffix to indicate UTC timestamps
+            for handoff in handoffs:
+                if handoff.get('timestamp') and not handoff['timestamp'].endswith('Z'):
+                    handoff['timestamp'] = handoff['timestamp'] + 'Z'
+
             # Get recent subagent invocations for this project
             subagents_cursor = self.conn.execute("""
                 SELECT
@@ -769,6 +930,11 @@ class OrchestrationDB:
             """, (project_name,))
 
             subagents = [dict(row) for row in subagents_cursor.fetchall()]
+
+            # Fix timezone handling for subagents: Add 'Z' suffix to indicate UTC timestamps
+            for subagent in subagents:
+                if subagent.get('timestamp') and not subagent['timestamp'].endswith('Z'):
+                    subagent['timestamp'] = subagent['timestamp'] + 'Z'
 
             # Calculate project-level statistics
             total_cost = 0.0
@@ -1009,6 +1175,438 @@ class OrchestrationDB:
             token_breakdown['total_tokens'] = total_tokens
 
         return result
+
+    # Enhanced orchestration methods
+    def track_token_budget(self, session_id: str, project_name: str = None,
+                          initial_budget: int = 5000, priority_level: str = 'medium') -> int:
+        """Create and track token budget for session"""
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT INTO token_budgets
+                (session_id, project_name, initial_budget, current_budget, priority_level)
+                VALUES (?, ?, ?, ?, ?)
+            """, (session_id, project_name, initial_budget, initial_budget, priority_level))
+            return cursor.lastrowid
+
+    def update_token_usage(self, session_id: str, claude_tokens: int = 0,
+                          deepseek_tokens: int = 0, other_tokens: int = 0):
+        """Update token usage for session budget"""
+        with self.conn:
+            # Update token counts
+            self.conn.execute("""
+                UPDATE token_budgets
+                SET claude_tokens_used = claude_tokens_used + ?,
+                    deepseek_tokens_used = deepseek_tokens_used + ?,
+                    other_tokens_used = other_tokens_used + ?,
+                    current_budget = initial_budget - (claude_tokens_used + deepseek_tokens_used + other_tokens_used),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            """, (claude_tokens, deepseek_tokens, other_tokens, session_id))
+
+            # Check if budget exhausted
+            result = self.conn.execute("""
+                SELECT current_budget FROM token_budgets WHERE session_id = ?
+            """, (session_id,)).fetchone()
+
+            if result and result[0] <= 0:
+                self.conn.execute("""
+                    UPDATE token_budgets SET budget_exhausted = TRUE WHERE session_id = ?
+                """, (session_id,))
+
+    def track_routing_decision(self, session_id: str, task_description: str,
+                              selected_model: str, selected_vendor: str,
+                              routing_score: float, confidence_score: float,
+                              task_complexity: str = 'medium',
+                              quality_requirement: float = 0.8,
+                              speed_requirement: str = 'normal',
+                              cost_budget: float = None,
+                              routing_factors: dict = None,
+                              alternatives_considered: list = None) -> int:
+        """Track routing decision with full context"""
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT INTO routing_decisions (
+                    session_id, task_description, task_complexity, quality_requirement,
+                    speed_requirement, cost_budget, selected_model, selected_vendor,
+                    routing_score, routing_factors, alternatives_considered, confidence_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, task_description, task_complexity, quality_requirement,
+                  speed_requirement, cost_budget, selected_model, selected_vendor,
+                  routing_score, json.dumps(routing_factors) if routing_factors else None,
+                  json.dumps(alternatives_considered) if alternatives_considered else None,
+                  confidence_score))
+            return cursor.lastrowid
+
+    def track_model_performance(self, model_name: str, vendor: str, task_type: str,
+                               complexity_level: str, response_time: float = None,
+                               tokens_used: int = None, cost: float = None,
+                               quality_score: float = None, success_rate: float = None,
+                               error_count: int = 0, user_rating: float = None,
+                               project_context: str = None) -> int:
+        """Track model performance metrics"""
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT INTO model_performance (
+                    model_name, vendor, task_type, complexity_level, response_time,
+                    tokens_used, cost, quality_score, success_rate, error_count,
+                    user_rating, project_context
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (model_name, vendor, task_type, complexity_level, response_time,
+                  tokens_used, cost, quality_score, success_rate, error_count,
+                  user_rating, project_context))
+            return cursor.lastrowid
+
+    def track_claude_hook(self, session_id: str, hook_type: str, trigger_event: str,
+                         hook_data: dict = None, processing_time: float = None,
+                         success: bool = True, error_message: str = None) -> int:
+        """Track Claude Code hook execution"""
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT INTO claude_code_hooks (
+                    session_id, hook_type, trigger_event, hook_data,
+                    processing_time, success, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, hook_type, trigger_event,
+                  json.dumps(hook_data) if hook_data else None,
+                  processing_time, success, error_message))
+            return cursor.lastrowid
+
+    def get_session_token_status(self, session_id: str) -> dict:
+        """Get current token budget status for session"""
+        cursor = self.conn.execute("""
+            SELECT * FROM token_budgets WHERE session_id = ? ORDER BY updated_at DESC LIMIT 1
+        """, (session_id,))
+
+        result = cursor.fetchone()
+        if result:
+            return dict(result)
+        return None
+
+    def get_routing_analytics(self, start_date: str = None, end_date: str = None,
+                             model_name: str = None) -> dict:
+        """Get routing decision analytics"""
+        base_query = """
+            SELECT
+                selected_model,
+                selected_vendor,
+                COUNT(*) as decision_count,
+                AVG(routing_score) as avg_routing_score,
+                AVG(confidence_score) as avg_confidence,
+                SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate,
+                AVG(actual_cost) as avg_cost,
+                AVG(actual_tokens) as avg_tokens,
+                AVG(actual_duration) as avg_duration
+            FROM routing_decisions
+            WHERE 1=1
+        """
+
+        params = []
+        if start_date and end_date:
+            base_query += " AND timestamp BETWEEN ? AND ?"
+            params.extend([start_date, end_date])
+        if model_name:
+            base_query += " AND selected_model = ?"
+            params.append(model_name)
+
+        base_query += " GROUP BY selected_model, selected_vendor ORDER BY decision_count DESC"
+
+        cursor = self.conn.execute(base_query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_model_performance_analytics(self, model_name: str = None, task_type: str = None) -> list:
+        """Get model performance analytics"""
+        base_query = """
+            SELECT
+                model_name,
+                vendor,
+                task_type,
+                complexity_level,
+                COUNT(*) as execution_count,
+                AVG(response_time) as avg_response_time,
+                AVG(tokens_used) as avg_tokens,
+                AVG(cost) as avg_cost,
+                AVG(quality_score) as avg_quality,
+                AVG(success_rate) as avg_success_rate,
+                SUM(error_count) as total_errors,
+                AVG(user_rating) as avg_user_rating
+            FROM model_performance
+            WHERE 1=1
+        """
+
+        params = []
+        if model_name:
+            base_query += " AND model_name = ?"
+            params.append(model_name)
+        if task_type:
+            base_query += " AND task_type = ?"
+            params.append(task_type)
+
+        base_query += """
+            GROUP BY model_name, vendor, task_type, complexity_level
+            ORDER BY execution_count DESC
+        """
+
+        cursor = self.conn.execute(base_query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_capacity_dashboard_data(self) -> dict:
+        """Get comprehensive capacity and orchestration dashboard data"""
+        # Token budget summary
+        token_summary = self.conn.execute("""
+            SELECT
+                COUNT(*) as total_sessions,
+                SUM(initial_budget) as total_initial_budget,
+                SUM(current_budget) as total_remaining_budget,
+                SUM(claude_tokens_used) as total_claude_tokens,
+                SUM(deepseek_tokens_used) as total_deepseek_tokens,
+                SUM(CASE WHEN budget_exhausted = 1 THEN 1 ELSE 0 END) as exhausted_sessions,
+                AVG(CASE WHEN current_budget > 0 THEN current_budget * 100.0 / initial_budget ELSE 0 END) as avg_remaining_percentage
+            FROM token_budgets
+            WHERE updated_at >= datetime('now', '-7 days')
+        """).fetchone()
+
+        # Recent routing decisions
+        recent_routing = self.conn.execute("""
+            SELECT
+                selected_model,
+                selected_vendor,
+                COUNT(*) as decision_count,
+                AVG(confidence_score) as avg_confidence
+            FROM routing_decisions
+            WHERE timestamp >= datetime('now', '-24 hours')
+            GROUP BY selected_model, selected_vendor
+            ORDER BY decision_count DESC
+        """).fetchall()
+
+        # Model performance trends
+        performance_trends = self.conn.execute("""
+            SELECT
+                model_name,
+                vendor,
+                COUNT(*) as executions,
+                AVG(response_time) as avg_response_time,
+                AVG(quality_score) as avg_quality,
+                AVG(success_rate) as avg_success_rate
+            FROM model_performance
+            WHERE timestamp >= datetime('now', '-7 days')
+            GROUP BY model_name, vendor
+            ORDER BY executions DESC
+        """).fetchall()
+
+        # Claude Code hooks activity
+        hooks_activity = self.conn.execute("""
+            SELECT
+                hook_type,
+                COUNT(*) as hook_count,
+                AVG(processing_time) as avg_processing_time,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate
+            FROM claude_code_hooks
+            WHERE timestamp >= datetime('now', '-24 hours')
+            GROUP BY hook_type
+            ORDER BY hook_count DESC
+        """).fetchall()
+
+        return {
+            'token_summary': dict(token_summary) if token_summary else {},
+            'recent_routing': [dict(row) for row in recent_routing],
+            'performance_trends': [dict(row) for row in performance_trends],
+            'hooks_activity': [dict(row) for row in hooks_activity]
+        }
+
+    # Live Activity Management
+    def record_live_activity(self, event_type: str, session_id: str = None,
+                            data: Dict = None, priority: int = 1) -> int:
+        """Record a new live activity event"""
+        if data is None:
+            data = {}
+
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT INTO live_activities (event_type, session_id, data, priority)
+                VALUES (?, ?, ?, ?)
+            """, (event_type, session_id, json.dumps(data), priority))
+            return cursor.lastrowid
+
+    def get_live_activities(self, limit: int = 50, offset: int = 0,
+                           event_type: str = None, since_timestamp: str = None,
+                           until_timestamp: str = None, project_name: str = None,
+                           session_id: str = None, search_text: str = None,
+                           sort_by: str = 'timestamp', sort_order: str = 'DESC') -> List[Dict]:
+        """Get live activities with comprehensive filtering and sorting"""
+
+        # Base query with project extraction from session data
+        query = """
+            SELECT la.id, la.event_type, la.session_id, la.data, la.timestamp, la.priority,
+                   COALESCE(s.project_name,
+                           JSON_EXTRACT(la.data, '$.project_name'),
+                           'Unknown') as project_name
+            FROM live_activities la
+            LEFT JOIN orchestration_sessions s ON la.session_id = s.session_id
+        """
+        params = []
+        conditions = []
+
+        # Event type filter
+        if event_type:
+            conditions.append("la.event_type = ?")
+            params.append(event_type)
+
+        # Time range filters
+        if since_timestamp:
+            conditions.append("la.timestamp >= ?")
+            params.append(since_timestamp)
+
+        if until_timestamp:
+            conditions.append("la.timestamp <= ?")
+            params.append(until_timestamp)
+
+        # Project filter
+        if project_name:
+            conditions.append("(s.project_name = ? OR JSON_EXTRACT(la.data, '$.project_name') = ?)")
+            params.extend([project_name, project_name])
+
+        # Session filter
+        if session_id:
+            conditions.append("la.session_id = ?")
+            params.append(session_id)
+
+        # Text search in activity data
+        if search_text:
+            conditions.append("(la.data LIKE ? OR la.event_type LIKE ?)")
+            search_pattern = f"%{search_text}%"
+            params.extend([search_pattern, search_pattern])
+
+        # Add WHERE clause if we have conditions
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        # Sorting
+        valid_sort_columns = ['timestamp', 'event_type', 'project_name', 'priority']
+        if sort_by not in valid_sort_columns:
+            sort_by = 'timestamp'
+
+        valid_sort_orders = ['ASC', 'DESC']
+        if sort_order.upper() not in valid_sort_orders:
+            sort_order = 'DESC'
+
+        query += f" ORDER BY {sort_by} {sort_order.upper()}"
+
+        # Pagination
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        cursor = self.conn.execute(query, params)
+        activities = []
+        for row in cursor.fetchall():
+            activity = dict(row)
+            activity['data'] = json.loads(activity['data'])
+            activities.append(activity)
+
+        return activities
+
+    def get_live_activities_count(self, event_type: str = None, since_timestamp: str = None,
+                                 until_timestamp: str = None, project_name: str = None,
+                                 session_id: str = None, search_text: str = None) -> int:
+        """Get total count of activities matching the filters"""
+        query = """
+            SELECT COUNT(*) as total
+            FROM live_activities la
+            LEFT JOIN orchestration_sessions s ON la.session_id = s.session_id
+        """
+        params = []
+        conditions = []
+
+        # Apply same filters as get_live_activities
+        if event_type:
+            conditions.append("la.event_type = ?")
+            params.append(event_type)
+
+        if since_timestamp:
+            conditions.append("la.timestamp >= ?")
+            params.append(since_timestamp)
+
+        if until_timestamp:
+            conditions.append("la.timestamp <= ?")
+            params.append(until_timestamp)
+
+        if project_name:
+            conditions.append("(s.project_name = ? OR JSON_EXTRACT(la.data, '$.project_name') = ?)")
+            params.extend([project_name, project_name])
+
+        if session_id:
+            conditions.append("la.session_id = ?")
+            params.append(session_id)
+
+        if search_text:
+            conditions.append("(la.data LIKE ? OR la.event_type LIKE ?)")
+            search_pattern = f"%{search_text}%"
+            params.extend([search_pattern, search_pattern])
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        cursor = self.conn.execute(query, params)
+        return cursor.fetchone()[0]
+
+    def get_activity_stats(self, period_hours: int = 24) -> Dict:
+        """Get live activity statistics"""
+        cursor = self.conn.execute("""
+            SELECT
+                event_type,
+                COUNT(*) as count,
+                MAX(timestamp) as latest_timestamp
+            FROM live_activities
+            WHERE timestamp >= datetime('now', '-{} hours')
+            GROUP BY event_type
+            ORDER BY count DESC
+        """.format(period_hours))
+
+        stats_by_type = {dict(row)['event_type']: dict(row) for row in cursor.fetchall()}
+
+        # Total activities
+        total_cursor = self.conn.execute("""
+            SELECT COUNT(*) as total_activities
+            FROM live_activities
+            WHERE timestamp >= datetime('now', '-{} hours')
+        """.format(period_hours))
+
+        total_activities = total_cursor.fetchone()[0]
+
+        return {
+            'total_activities': total_activities,
+            'by_type': stats_by_type,
+            'period_hours': period_hours
+        }
+
+    def get_unique_activity_projects(self) -> List[str]:
+        """Get unique project names from activities"""
+        cursor = self.conn.execute("""
+            SELECT DISTINCT
+                COALESCE(s.project_name, JSON_EXTRACT(la.data, '$.project_name')) as project_name
+            FROM live_activities la
+            LEFT JOIN orchestration_sessions s ON la.session_id = s.session_id
+            WHERE COALESCE(s.project_name, JSON_EXTRACT(la.data, '$.project_name')) IS NOT NULL
+            ORDER BY project_name
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_unique_activity_event_types(self) -> List[str]:
+        """Get unique event types from activities"""
+        cursor = self.conn.execute("""
+            SELECT DISTINCT event_type
+            FROM live_activities
+            ORDER BY event_type
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
+    def cleanup_old_activities(self, days_to_keep: int = 7):
+        """Clean up old live activities"""
+        with self.conn:
+            cursor = self.conn.execute("""
+                DELETE FROM live_activities
+                WHERE timestamp < datetime('now', '-{} days')
+            """.format(days_to_keep))
+            return cursor.rowcount
 
     def close(self):
         """Close database connection"""

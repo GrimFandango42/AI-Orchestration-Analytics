@@ -162,6 +162,36 @@ class ProjectAttributor:
             ]
         }
 
+    def detect_project_from_path(self, path: str) -> Tuple[str, float]:
+        """Simple project detection from working directory path"""
+        try:
+            # Extract project name from path
+            path_parts = Path(path).parts
+
+            # Look for AI_Projects in the path and get the project folder after it
+            ai_projects_index = -1
+            for i, part in enumerate(path_parts):
+                if part == 'AI_Projects':
+                    ai_projects_index = i
+                    break
+
+            if ai_projects_index != -1 and ai_projects_index + 1 < len(path_parts):
+                project_folder = path_parts[ai_projects_index + 1]
+
+                # Check if it matches a known project
+                for project_name, project_info in self.projects.items():
+                    if project_folder in project_info.get('paths', []) or project_folder.lower() == project_name.lower():
+                        return project_name, 0.9
+
+                # Return the folder name as fallback
+                return project_folder, 0.6
+
+            return "Unknown", 0.1
+
+        except Exception as e:
+            logger.warning(f"Error detecting project from path {path}: {e}")
+            return "Unknown", 0.1
+
     def detect_project_from_context(self,
                                    working_directory: str = None,
                                    file_paths: List[str] = None,
